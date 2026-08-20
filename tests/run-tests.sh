@@ -619,8 +619,11 @@ test_gpt_adapter_success_and_json() {
     grep -q '^model_provider = "anyrouter"$' "$ADAPTER_TEST_DIR/config.toml" &&
     grep -q '^model = "gpt-test"$' "$ADAPTER_TEST_DIR/config.toml" &&
     grep -q '^wire_api = "responses"$' "$ADAPTER_TEST_DIR/config.toml" &&
+    grep -q '^request_max_retries = 0$' "$ADAPTER_TEST_DIR/config.toml" &&
+    grep -q '^stream_max_retries = 0$' "$ADAPTER_TEST_DIR/config.toml" &&
     grep -q '^base_url = "https://anyrouter.top/v1"$' "$ADAPTER_TEST_DIR/config.toml" &&
     assert_contains "$(cat "$ADAPTER_TEST_DIR/argv")" 'exec' &&
+    assert_contains "$(cat "$ADAPTER_TEST_DIR/argv")" '--json' &&
     assert_contains "$(cat "$ADAPTER_TEST_DIR/argv")" '--ephemeral' &&
     assert_contains "$(cat "$ADAPTER_TEST_DIR/argv")" '--skip-git-repo-check' &&
     assert_contains "$(cat "$ADAPTER_TEST_DIR/argv")" '--sandbox read-only' &&
@@ -652,7 +655,7 @@ test_gpt_adapter_rejects_legacy_token_argument() {
 test_gpt_adapter_rate_limit() {
   setup_adapter_fixture || return
   write_fake_codex
-  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_EXIT=1 CODEX_STDOUT='' CODEX_STDERR='HTTP 429 busy secret response'
+  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_EXIT=1 CODEX_STDOUT='{"type":"error","message":"unexpected HTTP status 429 busy secret response"}' CODEX_STDERR=''
   local output status
   output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" ANYROUTER_TOKEN='sk-ant-secret-value' \
     bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
@@ -660,7 +663,7 @@ test_gpt_adapter_rate_limit() {
   status=$?
   rm -rf "$ADAPTER_TEST_DIR"
   [ "$status" -eq 0 ] && assert_contains "$output" 'status=rate_limited' &&
-    assert_contains "$output" 'http_code=000' &&
+    assert_contains "$output" 'http_code=429' &&
     assert_contains "$output" 'cli_exit_code=1' &&
     assert_not_contains "$output" 'sk-ant-secret-value' &&
     assert_not_contains "$output" 'busy secret response'
@@ -669,7 +672,7 @@ test_gpt_adapter_rate_limit() {
 test_gpt_adapter_invalid_model() {
   setup_adapter_fixture || return
   write_fake_codex
-  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_EXIT=1 CODEX_STDOUT='' CODEX_STDERR='unknown model private upstream detail'
+  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_EXIT=1 CODEX_STDOUT='{"type":"error","message":"unknown model private upstream detail"}' CODEX_STDERR=''
   local output status
   output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" ANYROUTER_TOKEN='sk-ant-secret-value' \
     bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
@@ -685,7 +688,7 @@ test_gpt_adapter_invalid_model() {
 test_gpt_adapter_authentication_error_is_distinct() {
   setup_adapter_fixture || return
   write_fake_codex
-  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_EXIT=1 CODEX_STDOUT='' CODEX_STDERR='HTTP 401 private credential detail'
+  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_EXIT=1 CODEX_STDOUT='{"type":"error","message":"HTTP 401 private credential detail"}' CODEX_STDERR=''
   local output status
   output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" ANYROUTER_TOKEN='sk-ant-secret-value' \
     bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
@@ -701,7 +704,7 @@ test_gpt_adapter_authentication_error_is_distinct() {
 test_gpt_adapter_request_configuration_error() {
   setup_adapter_fixture || return
   write_fake_codex
-  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_EXIT=1 CODEX_STDOUT='' CODEX_STDERR='invalid parameter detail'
+  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_EXIT=1 CODEX_STDOUT='{"type":"error","message":"invalid parameter detail"}' CODEX_STDERR=''
   local output status
   output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" ANYROUTER_TOKEN='sk-ant-secret-value' \
     bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
@@ -719,7 +722,7 @@ test_gpt_adapter_request_configuration_error() {
 test_gpt_adapter_network_failure() {
   setup_adapter_fixture || return
   write_fake_codex
-  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_STDOUT='' CODEX_STDERR='transport failure' CODEX_EXIT=7
+  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_STDOUT='{"type":"error","message":"transport failure"}' CODEX_STDERR='' CODEX_EXIT=7
   local output status
   output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" ANYROUTER_TOKEN='sk-ant-secret-value' \
     bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
@@ -920,6 +923,51 @@ SH
     assert_not_contains "$output" 'sk-ant-secret-value'
 }
 
+test_gpt_adapter_structured_errors_are_safe_and_distinct() {
+  setup_adapter_fixture || return
+  write_fake_codex
+  local output status
+
+  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_EXIT=1 CODEX_STDOUT='{"type":"turn.failed","error":{"status_code":503,"message":"private upstream detail"}}' CODEX_STDERR=''
+  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" ANYROUTER_TOKEN='sk-ant-secret-value' \
+    bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
+    'https://anyrouter.top/v1' 'gpt-test' 'Review code' 2>&1)"
+  status=$?
+  [ "$status" -eq 0 ] && assert_contains "$output" 'status=retryable' &&
+    assert_contains "$output" 'http_code=503' &&
+    assert_contains "$output" 'message=upstream_error' &&
+    assert_not_contains "$output" 'private upstream detail' || {
+      rm -rf "$ADAPTER_TEST_DIR"
+      return 1
+    }
+
+  export CODEX_STDOUT='{"type":"error","message":"failed to load configuration private config detail"}' CODEX_STDERR=''
+  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" ANYROUTER_TOKEN='sk-ant-secret-value' \
+    bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
+    'https://anyrouter.top/v1' 'gpt-test' 'Review code' 2>&1)"
+  status=$?
+  [ "$status" -eq 0 ] && assert_contains "$output" 'status=invalid' &&
+    assert_contains "$output" 'message=cli_configuration_error' &&
+    assert_not_contains "$output" 'private config detail' || {
+      rm -rf "$ADAPTER_TEST_DIR"
+      return 1
+    }
+
+  export CODEX_STDOUT='{"type":"error","message":"stream disconnected before completion private stream detail","request":{"prompt":"Explain HTTP 429 handling"}}' CODEX_STDERR='Echoed prompt: Explain HTTP 429 handling, unauthorized errors, and failed to load configuration'
+  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" ANYROUTER_TOKEN='sk-ant-secret-value' \
+    bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
+    'https://anyrouter.top/v1' 'gpt-test' 'Review code' 2>&1)"
+  status=$?
+  [ "$status" -eq 0 ] && assert_contains "$output" 'status=retryable' &&
+    assert_contains "$output" 'http_code=000' &&
+    assert_contains "$output" 'message=response_stream_error' &&
+    assert_not_contains "$output" 'private stream detail' &&
+    assert_not_contains "$output" 'sk-ant-secret-value'
+  local assertion_status=$?
+  rm -rf "$ADAPTER_TEST_DIR"
+  return "$assertion_status"
+}
+
 test_both_adapters_classify_fast_cli_startup_failures_safely() {
   local adapter command_name case_line expected exit_code output status
   for adapter in claude gpt; do
@@ -933,6 +981,9 @@ exit "$CLI_TEST_EXIT"
 SH
     chmod +x "$ADAPTER_TEST_DIR/bin/$command_name"
     while IFS='|' read -r exit_code expected case_line; do
+      if [ "$adapter" = gpt ] && { [ "$expected" = transport_error ] || [ "$expected" = cli_configuration_error ]; }; then
+        expected=cli_or_upstream_error
+      fi
       output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" CLI_TEST_EXIT="$exit_code" CLI_TEST_STDERR="$case_line" \
         ANYROUTER_TOKEN=sk-ant-secret-value bash "$ROOT_DIR/scripts/adapters/$adapter.sh" \
         https://anyrouter.top/v1 "${adapter}-test" 'private prompt' 2>&1)"
@@ -1014,6 +1065,7 @@ run_adapter_tests() {
   run_case "GPT adapter uses an isolated token-free Codex Responses provider" test_gpt_adapter_success_and_json
   run_case "GPT adapter rejects the legacy token-in-argv entrypoint" test_gpt_adapter_rejects_legacy_token_argument
   run_case "GPT Codex adapter maps 429 without exposing CLI output" test_gpt_adapter_rate_limit
+  run_case "GPT Codex adapter safely classifies structured upstream and stream errors" test_gpt_adapter_structured_errors_are_safe_and_distinct
   run_case "GPT Codex adapter maps an explicit missing model to invalid" test_gpt_adapter_invalid_model
   run_case "GPT Codex adapter distinguishes authentication failures" test_gpt_adapter_authentication_error_is_distinct
   run_case "GPT Codex adapter maps request configuration errors" test_gpt_adapter_request_configuration_error

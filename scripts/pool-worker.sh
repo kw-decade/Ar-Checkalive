@@ -222,7 +222,7 @@ log_result() {
   [[ "$log_elapsed" =~ ^[0-9]+$ ]] || log_elapsed=0
   [[ "$log_cli_exit" =~ ^[0-9]+$ ]] || log_cli_exit=0
   case "$log_message" in
-    non_empty_response|empty_response|capacity_limited|authentication_error|model_or_protocol_error|request_configuration_error|request_timeout|cli_or_upstream_error|cli_command_unavailable|cli_argument_error|cli_configuration_error|transport_error|upstream_error|unexpected_http_status|test_result) ;;
+    non_empty_response|empty_response|capacity_limited|authentication_error|model_or_protocol_error|request_configuration_error|request_timeout|cli_or_upstream_error|cli_command_unavailable|cli_argument_error|cli_configuration_error|transport_error|response_stream_error|upstream_error|unexpected_http_status|test_result) ;;
     *) log_message=unspecified ;;
   esac
   printf '[%s] phase=%s model=%s status=%s http_code=%s elapsed_sec=%s cli_exit_code=%s message=%s\n' \

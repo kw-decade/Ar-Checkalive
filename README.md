@@ -59,6 +59,8 @@ Claude 和 GPT 的状态、`notified` 标记及成功邮件彼此独立：哪个
 
 快速启动失败会只记录白名单诊断：`cli_command_unavailable`（命令不存在/不可执行）、`cli_argument_error`（CLI 参数错误）、`cli_configuration_error`（CLI 配置错误）或 `transport_error`（TLS/DNS/连接错误）。
 
+GPT adapter 使用 Codex 的 JSONL 事件流安全识别 `turn.failed` 和 `error`。只有错误事件明确包含 HTTP 状态时才记录真实的 `http_code`；例如 429 会显示 `http_code=429 message=capacity_limited`，5xx 会显示 `message=upstream_error`。如果 Codex 只报告 Responses 流提前断开而没有状态码，则保留 `http_code=000`，同时显示 `message=response_stream_error`。原始事件、上游正文和错误详情仍只存在于临时目录，不会写入 Actions 日志。
+
 GPT 经 Codex CLI 调用时通常无法可靠取到上游 HTTP 状态码，所以日志中的 `http_code=000` 表示“CLI 没有提供可安全记录的状态码”，不是一次 HTTP 000 请求。`message=model_or_protocol_error` 表示当前模型不存在/不受支持，或者 Anyrouter 当前不兼容 Codex 使用的 Responses 协议。自动发现模型时会继续尝试下一个候选；如果你用 Variable 固定了模型，则应检查模型名，必要时清空 Variable 让它重新自动发现。若模型名确认无误却持续出现这个消息，需要确认 Anyrouter 的 `/v1/responses` 支持情况。
 
 ## 安全与本地测试

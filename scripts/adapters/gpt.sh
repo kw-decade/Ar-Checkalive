@@ -72,6 +72,8 @@ name = "Anyrouter"
 base_url = "$base_url"
 wire_api = "responses"
 env_key = "OPENAI_API_KEY"
+request_max_retries = 0
+stream_max_retries = 0
 TOML
 
 set +e
@@ -81,7 +83,7 @@ env -u GITHUB_TOKEN -u QQ_EMAIL -u QQ_SMTP_AUTH_CODE \
   XDG_CONFIG_HOME="$isolated_home/.config" CODEX_HOME="$isolated_home" \
   OPENAI_API_KEY="$token" \
   timeout --foreground --kill-after=5 "$REQUEST_TIMEOUT_SEC" \
-    codex exec --ephemeral --skip-git-repo-check --sandbox read-only --model "$model" "$prompt" \
+    codex exec --json --ephemeral --skip-git-repo-check --sandbox read-only --model "$model" "$prompt" \
     >"$stdout_file" 2>"$stderr_file" &
 codex_pid=$!
 wait "$codex_pid"
@@ -98,22 +100,18 @@ if [ "$codex_status" -eq 0 ]; then
   fi
 elif [ "$codex_status" -eq 124 ]; then
   printf 'status=retryable\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=124\nmessage=request_timeout\n' "$elapsed_sec"
-elif grep -Eqi '(^|[^0-9])429([^0-9]|$)|rate[ _-]*limit|too many requests|capacity' "$stdout_file" "$stderr_file"; then
-  printf 'status=rate_limited\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=capacity_limited\n' "$elapsed_sec" "$codex_status"
-elif grep -Eqi '(^|[^0-9])(401|403)([^0-9]|$)|unauthorized|forbidden|authentication|invalid[ _-]*(token|api[ _-]*key)' "$stdout_file" "$stderr_file"; then
-  printf 'status=invalid\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=authentication_error\n' "$elapsed_sec" "$codex_status"
-elif grep -Eqi 'unknown[ _-]*model|model.*(not found|does not exist|unsupported|not supported)|unsupported.*(model|protocol)|protocol.*(unsupported|not supported)' "$stdout_file" "$stderr_file"; then
-  printf 'status=invalid\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=model_or_protocol_error\n' "$elapsed_sec" "$codex_status"
-elif [ "$codex_status" -eq 126 ] || [ "$codex_status" -eq 127 ] || grep -Eqi 'command not found|no such file or directory|not executable|cannot execute|permission denied' "$stdout_file" "$stderr_file"; then
-  printf 'status=retryable\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=cli_command_unavailable\n' "$elapsed_sec" "$codex_status"
-elif [ "$codex_status" -eq 2 ] || grep -Eqi 'unknown option|unrecognized option|invalid option|unexpected argument|usage:' "$stdout_file" "$stderr_file"; then
-  printf 'status=invalid\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=cli_argument_error\n' "$elapsed_sec" "$codex_status"
-elif grep -Eqi 'failed to (load|read|parse) (config|configuration|settings)|invalid (config|configuration|settings)|configuration (error|failed)|settings? (error|failed)|toml parse' "$stdout_file" "$stderr_file"; then
-  printf 'status=invalid\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=cli_configuration_error\n' "$elapsed_sec" "$codex_status"
-elif grep -Eqi 'tls|ssl|handshake|dns|could not resolve|connection (refused|reset|failed)|network|transport' "$stdout_file" "$stderr_file"; then
-  printf 'status=retryable\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=transport_error\n' "$elapsed_sec" "$codex_status"
-elif grep -Eqi 'bad request|invalid[ _-]*(request|argument|parameter)|missing[ _-]*(argument|parameter)' "$stdout_file" "$stderr_file"; then
-  printf 'status=invalid\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=request_configuration_error\n' "$elapsed_sec" "$codex_status"
 else
-  printf 'status=retryable\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=cli_or_upstream_error\n' "$elapsed_sec" "$codex_status"
+  diagnostic="$(node "$SCRIPT_DIR/../lib/classify-codex-error.mjs" \
+    "$stdout_file" "$stderr_file" "$codex_status" 2>/dev/null || true)"
+  status="$(awk -F= '$1 == "status" { print $2; exit }' <<< "$diagnostic")"
+  http_code="$(awk -F= '$1 == "http_code" { print $2; exit }' <<< "$diagnostic")"
+  message="$(awk -F= '$1 == "message" { print $2; exit }' <<< "$diagnostic")"
+  case "$status" in success|rate_limited|invalid|retryable) ;; *) status=retryable ;; esac
+  [[ "$http_code" =~ ^[0-9]{3}$ ]] || http_code=000
+  case "$message" in
+    capacity_limited|authentication_error|model_or_protocol_error|cli_command_unavailable|cli_argument_error|cli_configuration_error|transport_error|request_configuration_error|response_stream_error|upstream_error|cli_or_upstream_error) ;;
+    *) message=cli_or_upstream_error ;;
+  esac
+  printf 'status=%s\nhttp_code=%s\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=%s\n' \
+    "$status" "$http_code" "$elapsed_sec" "$codex_status" "$message"
 fi
