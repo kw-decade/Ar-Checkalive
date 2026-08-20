@@ -20,3 +20,7 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+common-debug.log
+model-debug.log
+model-debug2.log

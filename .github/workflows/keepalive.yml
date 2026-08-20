@@ -2,46 +2,136 @@ name: Anyrouter Keepalive
 
 on:
   schedule:
-    # UTC 18:00 = UTC+8 02:00 daily
     - cron: "0 18 * * *"
   workflow_dispatch:
     inputs:
+      mode:
+        description: "start, relay, or stop"
+        required: true
+        default: start
+        type: choice
+        options: [start, relay, stop]
       base_url:
-        description: 'API Base URL'
+        description: "Optional API base URL"
         required: false
-        default: 'https://a-ocnfniawgw.cn-shanghai.fcapp.run'
-      model:
-        description: 'Claude model for health checks'
+        default: "https://anyrouter.top/v1"
+      claude_phase:
         required: false
-        default: 'opus[1m]'
+        default: probing
+      gpt_phase:
+        required: false
+        default: probing
+      claude_model:
+        required: false
+      gpt_model:
+        required: false
+      claude_notified:
+        required: false
+        default: "false"
+      gpt_notified:
+        required: false
+        default: "false"
+      chain_id:
+        required: false
+      chain_started_epoch:
+        required: false
 
-# Prevent concurrent runs stacking up
-concurrency:
-  group: keepalive
-  cancel-in-progress: false
+permissions:
+  contents: read
+  actions: write
 
 jobs:
-  keepalive:
+  stop:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'stop' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6h max, our script self-terminates at ~5h58m
+    concurrency:
+      group: anyrouter-keepalive-stop
+      cancel-in-progress: false
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Write stop marker
+        run: bash scripts/stop-chain.sh write-marker "$RUNNER_TEMP/stop.json" "$(date +%s)"
+      - name: Upload stop marker
+        uses: actions/upload-artifact@v4
+        with:
+          name: anyrouter-stop-marker
+          path: ${{ runner.temp }}/stop.json
+          retention-days: 1
+      - name: Cancel active chain runs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: STOP_SCAN_DELAY_SEC=5 bash scripts/stop-chain.sh cancel-runs
 
+  chain:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.mode != 'stop' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    concurrency:
+      group: anyrouter-keepalive-chain
+      cancel-in-progress: false
+    env:
+      ANYROUTER_BASE_URL: ${{ inputs.base_url || 'https://anyrouter.top/v1' }}
+      ANYROUTER_CLAUDE_MODEL: ${{ vars.ANYROUTER_CLAUDE_MODEL }}
+      ANYROUTER_GPT_MODEL: ${{ vars.ANYROUTER_GPT_MODEL }}
+      CLAUDE_PHASE: ${{ inputs.claude_phase }}
+      GPT_PHASE: ${{ inputs.gpt_phase }}
+      CLAUDE_MODEL: ${{ inputs.claude_model }}
+      GPT_MODEL: ${{ inputs.gpt_model }}
+      CLAUDE_NOTIFIED: ${{ inputs.claude_notified }}
+      GPT_NOTIFIED: ${{ inputs.gpt_notified }}
+      CHAIN_ID: ${{ inputs.chain_id }}
+      CHAIN_STARTED_EPOCH: ${{ inputs.chain_started_epoch }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check stop marker before installing Claude
+        id: stop-check
+        env:
+          MODE: ${{ inputs.mode || 'start' }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          case "$MODE" in
+            start|relay|stop) ;;
+            *) printf 'Invalid mode: %s\n' "$MODE" >&2; exit 2 ;;
+          esac
+          if [ "$MODE" = relay ]; then
+            bash scripts/run-dual-pool.sh --mode relay --check-stop
+          else
+            CHAIN_STARTED_EPOCH="$(date +%s)" bash scripts/run-dual-pool.sh --mode start --check-stop
+          fi
       - name: Install Claude Code CLI
+        if: steps.stop-check.outputs.should_run == 'true'
         run: |
           curl -fsSL https://claude.ai/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
       - name: Verify Claude CLI
+        if: steps.stop-check.outputs.should_run == 'true'
         run: claude --version
-
-      - name: Run keepalive for all tokens
+      - name: Run dual pool chain
+        if: steps.stop-check.outputs.should_run == 'true'
         env:
+          MODE: ${{ inputs.mode || 'start' }}
           ANYROUTER_TOKENS: ${{ secrets.ANYROUTER_TOKENS }}
-          BASE_URL: ${{ github.event.inputs.base_url || 'https://a-ocnfniawgw.cn-shanghai.fcapp.run' }}
-          MODEL: ${{ github.event.inputs.model || 'opus[1m]' }}
           QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
           QQ_SMTP_AUTH_CODE: ${{ secrets.QQ_SMTP_AUTH_CODE }}
-          CI: "true"
-        run: bash scripts/run-all.sh
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+          MAX_DURATION_SEC: 17400
+          CHAIN_STARTED_EPOCH: ${{ steps.stop-check.outputs.chain_started_epoch }}
+          CHAIN_ID: ${{ steps.stop-check.outputs.chain_id }}
+        run: |
+          case "$MODE" in
+            start|relay|stop) ;;
+            *) printf 'Invalid mode: %s\n' "$MODE" >&2; exit 2 ;;
+          esac
+          bash scripts/run-dual-pool.sh --mode "$MODE"

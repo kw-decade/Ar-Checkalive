@@ -4,36 +4,34 @@ on:
   workflow_dispatch:
     inputs:
       base_url:
-        description: 'API Base URL'
+        description: "Optional API base URL"
         required: false
-        default: 'https://a-ocnfniawgw.cn-shanghai.fcapp.run'
-      model:
-        description: 'Claude model for health checks'
-        required: false
-        default: 'opus[1m]'
+        default: "https://anyrouter.top/v1"
+
+permissions:
+  contents: read
 
 jobs:
-  keepalive-once:
+  once:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Claude Code CLI
         run: |
           curl -fsSL https://claude.ai/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
       - name: Verify Claude CLI
         run: claude --version
-
-      - name: Run keepalive once for all tokens
+      - name: Run one request per pool
         env:
           ANYROUTER_TOKENS: ${{ secrets.ANYROUTER_TOKENS }}
-          BASE_URL: ${{ github.event.inputs.base_url || 'https://a-ocnfniawgw.cn-shanghai.fcapp.run' }}
-          MODEL: ${{ github.event.inputs.model || 'haiku' }}
           QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
           QQ_SMTP_AUTH_CODE: ${{ secrets.QQ_SMTP_AUTH_CODE }}
-          CI: "true"
-        run: bash scripts/run-all.sh --once
+          ANYROUTER_BASE_URL: ${{ inputs.base_url || 'https://anyrouter.top/v1' }}
+          ANYROUTER_CLAUDE_MODEL: ${{ vars.ANYROUTER_CLAUDE_MODEL }}
+          ANYROUTER_GPT_MODEL: ${{ vars.ANYROUTER_GPT_MODEL }}
+          MAX_DURATION_SEC: 60
+        run: bash scripts/run-dual-pool.sh --mode start --once

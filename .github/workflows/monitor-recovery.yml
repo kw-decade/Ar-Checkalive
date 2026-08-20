@@ -1,44 +1,37 @@
-name: Anyrouter Recovery Monitor
+name: Anyrouter Recovery Monitor (Legacy)
 
+# Legacy entry point: use keepalive.yml for the maintained dual-pool chain.
 on:
   workflow_dispatch:
     inputs:
       base_url:
-        description: 'API Base URL'
+        description: "Optional API base URL"
         required: false
-        default: 'https://a-ocnfniawgw.cn-shanghai.fcapp.run'
-      model:
-        description: 'Claude model for health checks'
-        required: false
-        default: 'claude-opus-4-8[1M]'
+        default: "https://anyrouter.top/v1"
 
-# Prevent concurrent runs stacking up
-concurrency:
-  group: monitor-recovery
-  cancel-in-progress: false
+permissions:
+  contents: read
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6h max
+    timeout-minutes: 30
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Claude Code CLI
         run: |
           curl -fsSL https://claude.ai/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
       - name: Verify Claude CLI
         run: claude --version
-
-      - name: Monitor tokens for recovery
+      - name: Run legacy monitor
         env:
           ANYROUTER_TOKENS: ${{ secrets.ANYROUTER_TOKENS }}
-          BASE_URL: ${{ github.event.inputs.base_url || 'https://a-ocnfniawgw.cn-shanghai.fcapp.run' }}
-          MODEL: ${{ github.event.inputs.model || 'opus[1m]' }}
           QQ_EMAIL: ${{ secrets.QQ_EMAIL }}
           QQ_SMTP_AUTH_CODE: ${{ secrets.QQ_SMTP_AUTH_CODE }}
-          CI: "true"
+          BASE_URL: ${{ inputs.base_url || 'https://anyrouter.top/v1' }}
+          MODEL: ${{ vars.ANYROUTER_CLAUDE_MODEL }}
+          MAX_DURATION_SEC: 1800
         run: bash scripts/monitor-recovery.sh
