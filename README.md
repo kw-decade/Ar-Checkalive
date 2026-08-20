@@ -53,7 +53,7 @@ GPT 模型会从 `/models` 过滤 GPT 家族，排除 embedding、image、audio�
 
 ## 怎么看 Actions 日志
 
-主循环每次请求只输出经过筛选的状态，不输出 prompt、key、模型回答或 CLI 原始报错。请求日志包含 `pool`（Claude/GPT 池）、`phase`（`probing` 挤号或 `keepalive` 保活）、`model`、`status`、`http_code`、`elapsed_sec`、`cli_exit_code` 和 `message`；等待日志还会显示 `next_delay_sec`。例如看到 `status=rate_limited message=capacity_limited`，表示该池仍在排队，稍后会继续尝试。`cli_exit_code` 始终是非负整数；超时为 `124`，参数尚未启动 CLI 的本地校验结果为 `0`。
+主循环每次请求只输出经过筛选的状态，不输出 prompt、key、模型回答或 CLI 原始报错。请求日志包含 `pool`（Claude/GPT 池）、`phase`（`probing` 挤号或 `keepalive` 保活）、`model`、`status`、`http_code`、`elapsed_sec`、`cli_exit_code` 和 `message`；等待日志还会显示 `next_delay_sec`。例如看到 `status=rate_limited message=capacity_limited`，表示该池仍在排队，稍后会继续尝试。`cli_exit_code` 始终是非负整数；超时为 `124`，参数尚未启动 CLI 的本地校验结果为 `0`。Claude 子进程关闭 CLI 自带的长时间内部重试，由池工作器统一控制下一次请求的 3–10 秒等待；超时后仍会检查 CLI 已写入的私有错误流，因此明确的模型、鉴权或限流错误不会继续伪装成普通超时。
 
 Claude 和 GPT 的状态、`notified` 标记及成功邮件彼此独立：哪个池先从挤号进入保活，就立即只发送哪个池的邮件；另一个池继续自己的挤号或保活。邮件发送失败只记一条安全错误，不会回退池状态，也不会终止另一池或整个工作流。
 
@@ -61,7 +61,7 @@ Claude 和 GPT 的状态、`notified` 标记及成功邮件彼此独立：哪个
 
 GPT adapter 使用 Codex 的 JSONL 事件流安全识别 `turn.failed` 和 `error`。只有错误事件明确包含 HTTP 状态时才记录真实的 `http_code`；例如 429 会显示 `http_code=429 message=capacity_limited`，5xx 会显示 `message=upstream_error`。如果 Codex 只报告 Responses 流提前断开而没有状态码，则保留 `http_code=000`，同时显示 `message=response_stream_error`。原始事件、上游正文和错误详情仍只存在于临时目录，不会写入 Actions 日志。
 
-GPT 经 Codex CLI 调用时通常无法可靠取到上游 HTTP 状态码，所以日志中的 `http_code=000` 表示“CLI 没有提供可安全记录的状态码”，不是一次 HTTP 000 请求。`message=model_or_protocol_error` 表示当前模型不存在/不受支持，或者 Anyrouter 当前不兼容 Codex 使用的 Responses 协议。自动发现模型时会继续尝试下一个候选；如果你用 Variable 固定了模型，则应检查模型名，必要时清空 Variable 让它重新自动发现。若模型名确认无误却持续出现这个消息，需要确认 Anyrouter 的 `/v1/responses` 支持情况。
+CLI 经 Claude 或 Codex 调用时通常无法可靠取到上游 HTTP 状态码，所以日志中的 `http_code=000` 表示“CLI 没有提供可安全记录的状态码”，不是一次 HTTP 000 请求。Claude Code 内置的 `fable[1m]`、`opus[1m]` 是别名，CLI 会先解析到 `ANTHROPIC_DEFAULT_FABLE_MODEL` 或 `ANTHROPIC_DEFAULT_OPUS_MODEL` 再发送 1M 请求；日志中的方括号现在会原样保留。Anyrouter 返回 503/529 时表示容量或池暂不可用，适配器会快速记录 `capacity_limited` 并按 3–10 秒继续 probing，不再让 Claude CLI 自己重试到 120 秒。`message=model_or_protocol_error` 仍表示当前模型不存在/不受支持，或者 Anyrouter 当前不兼容所用协议；固定 Variable 时应检查模型映射，自动发现时会继续尝试下一个候选。
 
 ## 安全与本地测试
 

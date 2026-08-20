@@ -213,7 +213,7 @@ result_value() {
 }
 
 safe_log_value() {
-  printf '%s' "$1" | tr '\r\n' '  ' | tr -cd '[:alnum:]_.:/+-' | cut -c1-96
+  printf '%s' "$1" | tr '\r\n' '  ' | tr -cd '[:alnum:]_.:/+\[\]-' | cut -c1-96
 }
 
 log_result() {

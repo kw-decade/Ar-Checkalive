@@ -2,7 +2,7 @@
 
 import { readFileSync } from "node:fs";
 
-const [stdoutPath, , exitCodeArg] = process.argv.slice(2);
+const [stdoutPath, stderrPath, exitCodeArg] = process.argv.slice(2);
 
 function readPrivateFile(path) {
   try {
@@ -42,6 +42,7 @@ function collectDiagnosticFields(value, output, key = "") {
 }
 
 const stdout = readPrivateFile(stdoutPath);
+const stderr = readPrivateFile(stderrPath);
 const errorStrings = [];
 
 for (const line of stdout.split(/\r?\n/)) {
@@ -54,7 +55,10 @@ for (const line of stdout.split(/\r?\n/)) {
   } catch {}
 }
 
-const privateDiagnostic = errorStrings.join("\n");
+// Codex can fail before its JSONL writer starts. Keep stderr private, but use
+// it for the same allowlisted classification as structured JSON events.
+const structuredDiagnostic = errorStrings.join("\n");
+const privateDiagnostic = structuredDiagnostic || stderr;
 const exitCode = /^\d+$/.test(exitCodeArg ?? "") ? Number(exitCodeArg) : 1;
 const codePatterns = [
   /\bHTTP(?:\s+(?:status(?:\s+code)?|code))?\s*[:=]?\s*([1-5]\d{2})\b/i,
@@ -95,7 +99,7 @@ if (exitCode === 126 || exitCode === 127) {
 } else if (/failed to (load|read|parse) (config|configuration|settings)|invalid (config|configuration|settings)|configuration (error|failed)|settings? (error|failed)|toml parse/i.test(privateDiagnostic)) {
   status = "invalid";
   message = "cli_configuration_error";
-} else if (/tls|ssl|handshake|dns|could not resolve|error sending request|failed to send request|request failed|connection (refused|reset|failed)|network|transport/i.test(privateDiagnostic)) {
+} else if (/tls|ssl|handshake|certificate.*(verify|verification)|cert[_ -]*(verify|verification)|dns|could not resolve|error sending request|failed to send request|request failed|connection (refused|reset|failed)|network|transport/i.test(privateDiagnostic)) {
   message = "transport_error";
 } else if (code === 400 || code === 422 || /bad request|invalid[ _-]*(request|argument|parameter)|missing[ _-]*(argument|parameter)/i.test(privateDiagnostic)) {
   status = "invalid";

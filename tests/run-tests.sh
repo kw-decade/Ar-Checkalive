@@ -763,9 +763,11 @@ write_fake_claude() {
 printf 'HOME=%s\nUSERPROFILE=%s\nXDG_CONFIG_HOME=%s\nBASE=%s\nCONFIG=%s\nARGS=%s\n' \
   "$HOME" "${USERPROFILE:-}" "${XDG_CONFIG_HOME:-}" "${ANTHROPIC_BASE_URL:-}" \
   "${CLAUDE_CONFIG_DIR:-}" "$*" > "$ADAPTER_TEST_DIR/claude.call"
-printf 'GITHUB_TOKEN=%s\nQQ_EMAIL=%s\nQQ_SMTP_AUTH_CODE=%s\nANYROUTER_TOKEN=%s\nANYROUTER_TOKENS=%s\nANTHROPIC_AUTH_TOKEN=%s\n' \
+printf 'GITHUB_TOKEN=%s\nQQ_EMAIL=%s\nQQ_SMTP_AUTH_CODE=%s\nANYROUTER_TOKEN=%s\nANYROUTER_TOKENS=%s\nANTHROPIC_AUTH_TOKEN=%s\nCLAUDE_CODE_MAX_RETRIES=%s\nANTHROPIC_DEFAULT_FABLE_MODEL=%s\nANTHROPIC_DEFAULT_FABLE_MODEL_NAME=%s\n' \
   "${GITHUB_TOKEN+x}" "${QQ_EMAIL+x}" "${QQ_SMTP_AUTH_CODE+x}" \
-  "${ANYROUTER_TOKEN+x}" "${ANYROUTER_TOKENS+x}" "${ANTHROPIC_AUTH_TOKEN+x}" >> "$ADAPTER_TEST_DIR/claude.call"
+  "${ANYROUTER_TOKEN+x}" "${ANYROUTER_TOKENS+x}" "${ANTHROPIC_AUTH_TOKEN+x}" \
+  "${CLAUDE_CODE_MAX_RETRIES:-}" "${ANTHROPIC_DEFAULT_FABLE_MODEL:-}" \
+  "${ANTHROPIC_DEFAULT_FABLE_MODEL_NAME:-}" >> "$ADAPTER_TEST_DIR/claude.call"
 printf '%s' "${CLAUDE_STDOUT:-}"
 printf '%s' "${CLAUDE_STDERR:-}" >&2
 exit "${CLAUDE_EXIT:-0}"
@@ -801,6 +803,9 @@ test_claude_adapter_isolated_success() {
     grep -q '^ANYROUTER_TOKEN=$' "$ADAPTER_TEST_DIR/claude.call" &&
     grep -q '^ANYROUTER_TOKENS=$' "$ADAPTER_TEST_DIR/claude.call" &&
     grep -q '^ANTHROPIC_AUTH_TOKEN=x$' "$ADAPTER_TEST_DIR/claude.call" &&
+    grep -q '^CLAUDE_CODE_MAX_RETRIES=0$' "$ADAPTER_TEST_DIR/claude.call" &&
+    grep -q '^ANTHROPIC_DEFAULT_FABLE_MODEL=$' "$ADAPTER_TEST_DIR/claude.call" &&
+    grep -q '^ANTHROPIC_DEFAULT_FABLE_MODEL_NAME=$' "$ADAPTER_TEST_DIR/claude.call" &&
     grep -q -- '--model claude-test' "$ADAPTER_TEST_DIR/claude.call" &&
     [ ! -e "$ADAPTER_TEST_DIR/original-home/.claude/settings.json" ]
   local assertion_status=$?
@@ -827,7 +832,63 @@ test_claude_adapter_error_categories_are_distinct() {
   status=$?
   [ "$status" -eq 0 ] && assert_contains "$output" 'message=model_or_protocol_error' &&
     assert_contains "$output" 'cli_exit_code=1' &&
-    assert_not_contains "$output" 'private model detail'
+    assert_not_contains "$output" 'private model detail' || {
+    rm -rf "$ADAPTER_TEST_DIR"
+    return 1
+  }
+  export CLAUDE_STDERR='API Error: 404 private unsupported alias detail'
+  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" bash "$ROOT_DIR/scripts/adapters/claude.sh" \
+    'sk-ant-secret-value' 'https://anyrouter.top/v1' 'fable[1m]' 'Review code' 2>&1)"
+  status=$?
+  [ "$status" -eq 0 ] && assert_contains "$output" 'status=invalid' &&
+    assert_contains "$output" 'message=model_or_protocol_error' &&
+    assert_contains "$output" 'cli_exit_code=1' &&
+    assert_not_contains "$output" 'private unsupported alias detail' || {
+    rm -rf "$ADAPTER_TEST_DIR"
+    return 1
+  }
+  export CLAUDE_STDERR='API Error: 当前 API 不支持所选模型 fable[1m]'
+  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" bash "$ROOT_DIR/scripts/adapters/claude.sh" \
+    'sk-ant-secret-value' 'https://anyrouter.top/v1' 'fable[1m]' 'Review code' 2>&1)"
+  status=$?
+  [ "$status" -eq 0 ] && assert_contains "$output" 'status=invalid' &&
+    assert_contains "$output" 'message=model_or_protocol_error' &&
+    assert_contains "$output" 'cli_exit_code=1' &&
+    assert_not_contains "$output" '当前 API 不支持所选模型'
+  local assertion_status=$?
+  rm -rf "$ADAPTER_TEST_DIR"
+  return "$assertion_status"
+}
+
+test_claude_adapter_preserves_bracketed_model_argument() {
+  setup_adapter_fixture || return
+  write_fake_claude
+  export CLAUDE_STDOUT='Use a bounded queue.' CLAUDE_STDERR='' CLAUDE_EXIT=0
+  local output status
+  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" bash "$ROOT_DIR/scripts/adapters/claude.sh" \
+    'sk-ant-secret-value' 'https://anyrouter.top/v1' 'fable[1m]' 'Review code' 2>&1)"
+  status=$?
+  [ "$status" -eq 0 ] && assert_contains "$output" 'status=success' &&
+    grep -q -- '--model fable\[1m\]' "$ADAPTER_TEST_DIR/claude.call" &&
+    grep -q '^ANTHROPIC_DEFAULT_FABLE_MODEL=claude-fable-5\[1M\]$' "$ADAPTER_TEST_DIR/claude.call" &&
+    grep -q '^ANTHROPIC_DEFAULT_FABLE_MODEL_NAME=claude-fable-5$' "$ADAPTER_TEST_DIR/claude.call"
+  local assertion_status=$?
+  rm -rf "$ADAPTER_TEST_DIR"
+  return "$assertion_status"
+}
+
+test_claude_adapter_preserves_explicit_fable_model_mapping() {
+  setup_adapter_fixture || return
+  write_fake_claude
+  export CLAUDE_STDOUT='Use a bounded queue.' CLAUDE_STDERR='' CLAUDE_EXIT=0
+  local output status
+  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" bash "$ROOT_DIR/scripts/adapters/claude.sh" \
+    'sk-ant-secret-value' 'https://anyrouter.top/v1' 'claude-fable-5[1M]' 'Review code' 2>&1)"
+  status=$?
+  [ "$status" -eq 0 ] && assert_contains "$output" 'status=success' &&
+    grep -q -- '--model claude-fable-5\[1M\]' "$ADAPTER_TEST_DIR/claude.call" &&
+    grep -q '^ANTHROPIC_DEFAULT_FABLE_MODEL=claude-fable-5\[1M\]$' "$ADAPTER_TEST_DIR/claude.call" &&
+    grep -q '^ANTHROPIC_DEFAULT_FABLE_MODEL_NAME=claude-fable-5$' "$ADAPTER_TEST_DIR/claude.call"
   local assertion_status=$?
   rm -rf "$ADAPTER_TEST_DIR"
   return "$assertion_status"
@@ -899,6 +960,21 @@ test_claude_adapter_rate_limit_is_safe() {
     assert_not_contains "$output" 'private upstream response'
 }
 
+test_claude_adapter_service_unavailable_is_capacity_limited() {
+  setup_adapter_fixture || return
+  write_fake_claude
+  export CLAUDE_STDOUT='' CLAUDE_STDERR='HTTP 503 Service Unavailable private upstream response' CLAUDE_EXIT=1
+  local output status
+  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" bash "$ROOT_DIR/scripts/adapters/claude.sh" \
+    'sk-ant-secret-value' 'https://anyrouter.top/v1' 'claude-fable-5[1M]' 'Review code' 2>&1)"
+  status=$?
+  rm -rf "$ADAPTER_TEST_DIR"
+  [ "$status" -eq 0 ] && assert_contains "$output" 'status=rate_limited' &&
+    assert_contains "$output" 'http_code=503' &&
+    assert_contains "$output" 'message=capacity_limited' &&
+    assert_not_contains "$output" 'private upstream response'
+}
+
 test_claude_adapter_timeout_is_retryable() {
   setup_adapter_fixture || return
   cat > "$ADAPTER_TEST_DIR/bin/claude" <<'SH'
@@ -921,6 +997,30 @@ SH
     assert_contains "$output" 'cli_exit_code=124' &&
     assert_not_contains "$output" 'late response' &&
     assert_not_contains "$output" 'sk-ant-secret-value'
+}
+
+test_claude_adapter_timeout_classifies_model_error() {
+  setup_adapter_fixture || return
+  cat > "$ADAPTER_TEST_DIR/bin/claude" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' 'unknown model fable[1m] private model detail' >&2
+/usr/bin/sleep 3
+SH
+  chmod +x "$ADAPTER_TEST_DIR/bin/claude"
+  local output status start_epoch elapsed
+  start_epoch="$(date +%s)"
+  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" HOME="$ADAPTER_TEST_DIR/original-home" \
+    REQUEST_TIMEOUT_SEC=1 bash "$ROOT_DIR/scripts/adapters/claude.sh" \
+    'sk-ant-secret-value' 'https://anyrouter.top/v1' 'fable[1m]' 'Review code' 2>&1)"
+  status=$?
+  elapsed=$(( $(date +%s) - start_epoch ))
+  rm -rf "$ADAPTER_TEST_DIR"
+  [ "$status" -eq 0 ] && [ "$elapsed" -le 2 ] &&
+    assert_contains "$output" 'status=invalid' &&
+    assert_contains "$output" 'http_code=000' &&
+    assert_contains "$output" 'message=model_or_protocol_error' &&
+    assert_contains "$output" 'cli_exit_code=124' &&
+    assert_not_contains "$output" 'private model detail'
 }
 
 test_gpt_adapter_structured_errors_are_safe_and_distinct() {
@@ -981,9 +1081,6 @@ exit "$CLI_TEST_EXIT"
 SH
     chmod +x "$ADAPTER_TEST_DIR/bin/$command_name"
     while IFS='|' read -r exit_code expected case_line; do
-      if [ "$adapter" = gpt ] && { [ "$expected" = transport_error ] || [ "$expected" = cli_configuration_error ]; }; then
-        expected=cli_or_upstream_error
-      fi
       output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" CLI_TEST_EXIT="$exit_code" CLI_TEST_STDERR="$case_line" \
         ANYROUTER_TOKEN=sk-ant-secret-value bash "$ROOT_DIR/scripts/adapters/$adapter.sh" \
         https://anyrouter.top/v1 "${adapter}-test" 'private prompt' 2>&1)"
@@ -1002,6 +1099,7 @@ SH
 2|cli_argument_error|unexpected argument --private-option
 1|cli_configuration_error|failed to load configuration private detail
 7|transport_error|TLS handshake failed could not resolve host private detail
+1|transport_error|Unable to connect to API UNKNOWN_CERTIFICATE_VERIFICATION_ERROR private detail
 CASES
     rm -rf "$ADAPTER_TEST_DIR"
   done
@@ -1073,8 +1171,12 @@ run_adapter_tests() {
   run_case "GPT Codex adapter bounds a blocked request with timeout" test_gpt_adapter_timeout_is_retryable
   run_case "Claude adapter uses an isolated HOME and root base URL" test_claude_adapter_isolated_success
   run_case "Claude adapter maps 429 without exposing CLI output" test_claude_adapter_rate_limit_is_safe
+  run_case "Claude adapter maps 503 capacity failures without exposing CLI output" test_claude_adapter_service_unavailable_is_capacity_limited
   run_case "Claude adapter distinguishes authentication and model failures" test_claude_adapter_error_categories_are_distinct
+  run_case "Claude adapter preserves bracketed model aliases" test_claude_adapter_preserves_bracketed_model_argument
+  run_case "Claude adapter preserves explicit Fable model mappings" test_claude_adapter_preserves_explicit_fable_model_mapping
   run_case "Claude adapter bounds a blocked CLI call with timeout" test_claude_adapter_timeout_is_retryable
+  run_case "Claude adapter classifies model errors captured before timeout" test_claude_adapter_timeout_classifies_model_error
   run_case "both CLI adapters safely classify fast local startup failures" test_both_adapters_classify_fast_cli_startup_failures_safely
   run_case "SIGTERM directly cleans the Claude timeout tree and isolated HOME" test_claude_adapter_term_cleans_cli_tree_and_home
   run_case "SIGTERM cleans the GPT Codex process tree and isolated HOME" test_gpt_adapter_term_removes_private_config
@@ -1382,6 +1484,21 @@ test_worker_logs_only_integer_cli_exit_code() {
   status=$?
   [ "$status" -eq 0 ] && grep -Eq '^\[gpt\].*cli_exit_code=0( |$)' <<< "$output" &&
     ! grep -Eq 'cli_exit_code=[^0-9 ]' <<< "$output" &&
+    assert_not_contains "$output" 'sk-ant-secret-worker'
+  local assertion_status=$?
+  rm -rf "$WORKER_TEST_DIR"
+  return "$assertion_status"
+}
+
+test_worker_logs_bracketed_model_alias_without_stripping_it() {
+  setup_worker_fixture || return
+  printf 'success\n' > "$WORKER_RESULTS"
+  local state_file output status
+  state_file="$WORKER_TEST_DIR/claude.state"
+  output="$(run_test_worker claude 'fable[1m]' "$state_file" 1)"
+  status=$?
+  [ "$status" -eq 0 ] &&
+    assert_contains "$output" 'model=fable[1m]' &&
     assert_not_contains "$output" 'sk-ant-secret-worker'
   local assertion_status=$?
   rm -rf "$WORKER_TEST_DIR"
@@ -1735,6 +1852,7 @@ run_worker_tests() {
   run_case "a CRLF-discovered model reaches the adapter without a carriage return" test_worker_dynamic_crlf_candidate_reaches_adapter_without_carriage_return
   run_case "authentication errors stop without trying another model" test_worker_authentication_error_never_advances_candidate
   run_case "worker logs a sanitized integer cli exit code" test_worker_logs_only_integer_cli_exit_code
+  run_case "worker logs bracketed model aliases without stripping brackets" test_worker_logs_bracketed_model_alias_without_stripping_it
   run_case "worker runs a non-executable adapter through Bash" test_worker_runs_non_executable_adapter_with_bash
   run_case "adapter subprocess receives only the Anyrouter token secret" test_worker_adapter_receives_only_required_secret
   run_case "SMTP failure cannot undo a successful transition" test_worker_smtp_failure_does_not_change_success
@@ -2775,7 +2893,7 @@ test_debug_log_names_are_ignored() {
     grep -qxF 'model-debug.log' "$ROOT_DIR/.gitignore" &&
     grep -qxF 'model-debug2.log' "$ROOT_DIR/.gitignore" &&
     ! grep -qxF 'model-debug*.log' "$ROOT_DIR/.gitignore" || return 1
-  ignored="$(printf '%s\n' common-debug.log model-debug.log model-debug2.log | git -C "$ROOT_DIR" check-ignore --stdin)"
+  ignored="$(printf '%s\n' common-debug.log model-debug.log model-debug2.log | git -c safe.directory="$ROOT_DIR" -C "$ROOT_DIR" check-ignore --stdin)"
   assert_eq $'common-debug.log\nmodel-debug.log\nmodel-debug2.log' "$ignored"
 }
 
