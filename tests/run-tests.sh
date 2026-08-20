@@ -1336,6 +1336,53 @@ test_worker_logs_only_integer_cli_exit_code() {
   return "$assertion_status"
 }
 
+test_worker_runs_non_executable_adapter_with_bash() {
+  setup_worker_fixture || return
+  local adapter="$WORKER_TEST_DIR/bin/non-executable-adapter"
+  local state_file="$WORKER_TEST_DIR/gpt.state"
+  local output status
+  cat > "$adapter" <<'SH'
+#!/usr/bin/env bash
+printf 'status=success\nhttp_code=200\nelapsed_sec=0\ncli_exit_code=0\nmessage=non_empty_response\n'
+SH
+  chmod 0644 "$adapter"
+  cat > "$WORKER_TEST_DIR/bin/env" <<'SH'
+#!/usr/bin/env bash
+args=("$@")
+index=0
+while [ "$index" -lt "${#args[@]}" ]; do
+  case "${args[$index]}" in
+    -u|--unset) index=$((index + 2)) ;;
+    *=*) index=$((index + 1)) ;;
+    --) index=$((index + 1)); break ;;
+    *) break ;;
+  esac
+done
+if [ "${args[$index]:-}" = "$NON_EXECUTABLE_ADAPTER" ]; then
+  printf '%s: Permission denied\n' "$NON_EXECUTABLE_ADAPTER" >&2
+  exit 126
+fi
+exec /usr/bin/env "$@"
+SH
+  chmod +x "$WORKER_TEST_DIR/bin/env"
+  output="$(PATH="$WORKER_TEST_DIR/bin:$PATH" ADAPTER_COMMAND="$adapter" \
+    NON_EXECUTABLE_ADAPTER="$adapter" \
+    SLEEP_COMMAND="$WORKER_TEST_DIR/bin/record-sleep" PROMPTS_FILE="$WORKER_PROMPTS" \
+    MAX_ITERATIONS=1 MAX_DURATION_SEC=60 EMAIL_LOG="$WORKER_EMAIL" \
+    CHAIN_ID=chain-test CHAIN_STARTED_EPOCH=123 ANYROUTER_TOKEN=sk-ant-secret-worker \
+    bash "$ROOT_DIR/scripts/pool-worker.sh" gpt https://anyrouter.top/v1 gpt-test "$state_file" 2>&1)"
+  status=$?
+  [ "$status" -eq 0 ] &&
+    assert_eq keepalive "$(read_state_value "$state_file" phase)" &&
+    assert_eq true "$(read_state_value "$state_file" notified)" &&
+    assert_eq 1 "$(grep -c '^gpt|success$' "$WORKER_EMAIL")" &&
+    assert_not_contains "$output" 'Permission denied' &&
+    assert_not_contains "$output" 'sk-ant-secret-worker'
+  local assertion_status=$?
+  rm -rf "$WORKER_TEST_DIR"
+  return "$assertion_status"
+}
+
 test_worker_adapter_receives_only_required_secret() {
   setup_worker_fixture || return
   printf 'success\n' > "$WORKER_RESULTS"
@@ -1636,6 +1683,7 @@ run_worker_tests() {
   run_case "a CRLF-discovered model reaches the adapter without a carriage return" test_worker_dynamic_crlf_candidate_reaches_adapter_without_carriage_return
   run_case "authentication errors stop without trying another model" test_worker_authentication_error_never_advances_candidate
   run_case "worker logs a sanitized integer cli exit code" test_worker_logs_only_integer_cli_exit_code
+  run_case "worker runs a non-executable adapter through Bash" test_worker_runs_non_executable_adapter_with_bash
   run_case "adapter subprocess receives only the Anyrouter token secret" test_worker_adapter_receives_only_required_secret
   run_case "SMTP failure cannot undo a successful transition" test_worker_smtp_failure_does_not_change_success
   run_case "SMTP timeout cannot block later worker iterations or leak processes" test_worker_smtp_timeout_continues_and_cleans_processes

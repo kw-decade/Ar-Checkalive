@@ -296,7 +296,7 @@ while :; do
   adapter_exit=0
   : > "$adapter_result_file"
   env -u GITHUB_TOKEN -u QQ_EMAIL -u QQ_SMTP_AUTH_CODE -u ANYROUTER_TOKENS \
-    ANYROUTER_TOKEN="$token" "$ADAPTER_COMMAND" "$base_url" "$model" "$prompt" >"$adapter_result_file" 2>&1 &
+    ANYROUTER_TOKEN="$token" bash "$ADAPTER_COMMAND" "$base_url" "$model" "$prompt" >"$adapter_result_file" 2>&1 &
   adapter_pid=$!
   wait "$adapter_pid" || adapter_exit=$?
   adapter_pid=''
