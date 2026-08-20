@@ -93,6 +93,7 @@ discover_candidate_list() {
     set -e
     [ "$status" -eq 0 ] || return 1
   fi
+  candidate_output="${candidate_output//$'\r'/}"
   mapfile -t model_candidates <<< "$candidate_output"
   model_candidate_index=0
   [ "${#model_candidates[@]}" -gt 0 ]
@@ -211,6 +212,22 @@ result_value() {
   awk -F= -v wanted="$key" '$1 == wanted { sub(/^[^=]*=/, ""); print; exit }' <<< "$result"
 }
 
+safe_log_value() {
+  printf '%s' "$1" | tr '\r\n' '  ' | tr -cd '[:alnum:]_.:/+-' | cut -c1-96
+}
+
+log_result() {
+  local log_phase="$1" log_status="$2" log_http="$3" log_elapsed="$4" log_message="$5"
+  [[ "$log_http" =~ ^[0-9]{3}$ ]] || log_http=000
+  [[ "$log_elapsed" =~ ^[0-9]+$ ]] || log_elapsed=0
+  case "$log_message" in
+    non_empty_response|empty_response|capacity_limited|authentication_error|model_or_protocol_error|request_configuration_error|request_timeout|cli_or_upstream_error|transport_error|upstream_error|unexpected_http_status|test_result) ;;
+    *) log_message=unspecified ;;
+  esac
+  printf '[%s] phase=%s model=%s status=%s http_code=%s elapsed_sec=%s message=%s\n' \
+    "$pool" "$log_phase" "$(safe_log_value "$model")" "$log_status" "$log_http" "$log_elapsed" "$log_message"
+}
+
 actions_url() {
   if [ -n "${GITHUB_SERVER_URL:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${GITHUB_RUN_ID:-}" ]; then
     printf '%s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
@@ -259,6 +276,7 @@ sleep_for_phase() {
   else
     delay="$(random_between "$PROBE_MIN_SEC" "$PROBE_MAX_SEC")"
   fi
+  printf '[%s] phase=%s next_delay_sec=%s\n' "$pool" "$phase" "$delay"
   "$SLEEP_COMMAND" "$delay" &
   sleep_pid=$!
   wait "$sleep_pid" || sleep_status=$?
@@ -284,9 +302,14 @@ while :; do
   result="$(cat "$adapter_result_file")"
   if [ "$adapter_exit" -ne 0 ]; then
     status=retryable
+    message=cli_or_upstream_error
+    http_code=000
+    elapsed_sec=0
   else
     status="$(result_value "$result" status)"
     message="$(result_value "$result" message)"
+    http_code="$(result_value "$result" http_code)"
+    elapsed_sec="$(result_value "$result" elapsed_sec)"
     case "$status" in success|rate_limited|invalid|retryable) ;; *) status=retryable ;; esac
   fi
 
@@ -300,16 +323,20 @@ while :; do
       else
         persist_state
       fi
+      log_result "$phase" "$status" "$http_code" "$elapsed_sec" "$message"
       ;;
     rate_limited)
       phase=probing
       notified=false
       persist_state
+      log_result "$phase" "$status" "$http_code" "$elapsed_sec" "$message"
       ;;
     retryable)
       persist_state
+      log_result "$phase" "$status" "$http_code" "$elapsed_sec" "$message"
       ;;
     invalid)
+      log_result "$phase" "$status" "$http_code" "$elapsed_sec" "$message"
       if [ "$message" = model_or_protocol_error ] && advance_model_after_invalid; then
         iterations=$((iterations + 1))
         if [ "$MAX_ITERATIONS" -gt 0 ] && [ "$iterations" -ge "$MAX_ITERATIONS" ]; then break; fi

@@ -74,7 +74,9 @@ test_base_url_allowlist_and_canonicalization() {
     'https://example.com/v1' \
     'https://anyrouter.top/extra' \
     'https://anyrouter.top/v1/models' \
-    'https://anyrouter.top/v1?x=1'; do
+    'https://anyrouter.top/v1?x=1' \
+    $'https://anyrouter.top/v1\nbase_url = "https://example.com/v1"' \
+    'https://anyrouter.top/v1"'; do
     output="$(normalize_base_url "$input" 2>/dev/null)"
     status=$?
     [ "$status" -ne 0 ] || {
@@ -527,67 +529,73 @@ setup_adapter_fixture() {
   export ADAPTER_TEST_DIR
 }
 
-write_fake_curl() {
-  cat > "$ADAPTER_TEST_DIR/bin/curl" <<'SH'
+write_fake_codex() {
+  cat > "$ADAPTER_TEST_DIR/bin/codex" <<'SH'
 #!/usr/bin/env bash
-output_file=''
-data_file=''
-url=''
-printf '%s\n' "$*" > "$ADAPTER_TEST_DIR/curl.argv"
+printf '%s\n' "$*" > "$CODEX_TEST_DIR/argv"
+printf '%s\n' "${HOME:-}" > "$CODEX_TEST_DIR/home"
+printf '%s\n' "${CODEX_HOME:-}" > "$CODEX_TEST_DIR/codex-home"
+printf '%s\n' "${OPENAI_API_KEY:+set}" > "$CODEX_TEST_DIR/key-state"
 printf 'GITHUB_TOKEN=%s\nQQ_EMAIL=%s\nQQ_SMTP_AUTH_CODE=%s\nANYROUTER_TOKEN=%s\nANYROUTER_TOKENS=%s\n' \
   "${GITHUB_TOKEN+x}" "${QQ_EMAIL+x}" "${QQ_SMTP_AUTH_CODE+x}" \
-  "${ANYROUTER_TOKEN+x}" "${ANYROUTER_TOKENS+x}" > "$ADAPTER_TEST_DIR/curl.env"
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --config|-K)
-      printf '%s\n' "$2" > "$ADAPTER_TEST_DIR/config.path"
-      stat -c '%a' "$2" > "$ADAPTER_TEST_DIR/config.mode"
-      cp "$2" "$ADAPTER_TEST_DIR/config.copy"
-      shift 2
-      ;;
-    --output|-o) output_file="$2"; shift 2 ;;
-    --write-out|-w) shift 2 ;;
-    --data-binary) data_file="${2#@}"; shift 2 ;;
-    -H|--header|--max-time|--connect-timeout) shift 2 ;;
-    --silent|--show-error) shift ;;
-    *) url="$1"; shift ;;
-  esac
-done
-printf '%s\n' "$url" > "$ADAPTER_TEST_DIR/curl.url"
-if [ -n "$data_file" ]; then cp "$data_file" "$ADAPTER_TEST_DIR/request.json"; fi
-printf '%s' "$CURL_BODY" > "$output_file"
-printf '%s' "$CURL_HTTP_CODE"
-exit "${CURL_EXIT:-0}"
+  "${ANYROUTER_TOKEN+x}" "${ANYROUTER_TOKENS+x}" > "$CODEX_TEST_DIR/env"
+if [ -n "${CODEX_HOME:-}" ] && [ -r "$CODEX_HOME/config.toml" ]; then
+  cp "$CODEX_HOME/config.toml" "$CODEX_TEST_DIR/config.toml"
+fi
+printf '%s' "${CODEX_STDOUT:-safe response}"
+printf '%s' "${CODEX_STDERR:-}" >&2
+exit "${CODEX_EXIT:-0}"
 SH
-  chmod +x "$ADAPTER_TEST_DIR/bin/curl"
+  chmod +x "$ADAPTER_TEST_DIR/bin/codex"
 }
 
 test_gpt_adapter_success_and_json() {
   setup_adapter_fixture || return
-  write_fake_curl
-  export CURL_HTTP_CODE=200 CURL_BODY='{"choices":[{"message":{"content":"Use a bounded queue."}}]}'
-  local output status config_path
+  write_fake_codex
+  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_EXIT=0 CODEX_STDOUT='Use a bounded queue.' CODEX_STDERR=''
+  local output status
   output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" HOME="$ADAPTER_TEST_DIR/original-home" \
     GITHUB_TOKEN=present QQ_EMAIL=present QQ_SMTP_AUTH_CODE=present ANYROUTER_TOKENS=present \
     ANYROUTER_TOKEN='sk-ant-secret-value' bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
     'https://anyrouter.top/v1/' 'gpt-test' 'Review "quoted" input safely.' 2>&1)"
   status=$?
-  config_path="$(cat "$ADAPTER_TEST_DIR/config.path" 2>/dev/null || true)"
   [ "$status" -eq 0 ] && assert_contains "$output" 'status=success' &&
-    assert_contains "$output" 'http_code=200' &&
+    assert_contains "$output" 'http_code=000' &&
     [[ "$output" =~ elapsed_sec=[0-9]+ ]] &&
     assert_not_contains "$output" 'sk-ant-secret-value' &&
     assert_not_contains "$output" 'Use a bounded queue.' &&
-    ! grep -q 'sk-ant-secret-value' "$ADAPTER_TEST_DIR/curl.argv" &&
-    grep -q 'Authorization: Bearer sk-ant-secret-value' "$ADAPTER_TEST_DIR/config.copy" &&
-    assert_eq 600 "$(cat "$ADAPTER_TEST_DIR/config.mode")" && [ ! -e "$config_path" ] &&
-    grep -q '^GITHUB_TOKEN=$' "$ADAPTER_TEST_DIR/curl.env" &&
-    grep -q '^QQ_EMAIL=$' "$ADAPTER_TEST_DIR/curl.env" &&
-    grep -q '^QQ_SMTP_AUTH_CODE=$' "$ADAPTER_TEST_DIR/curl.env" &&
-    grep -q '^ANYROUTER_TOKEN=$' "$ADAPTER_TEST_DIR/curl.env" &&
-    grep -q '^ANYROUTER_TOKENS=$' "$ADAPTER_TEST_DIR/curl.env" &&
-    assert_eq 'https://anyrouter.top/v1/chat/completions' "$(cat "$ADAPTER_TEST_DIR/curl.url")" &&
-    python -c 'import json,sys; p=json.load(open(sys.argv[1], encoding="utf-8")); assert p["model"] == "gpt-test"; assert p["messages"][0]["content"] == "Review \"quoted\" input safely."; assert p["max_tokens"] == 600' "$ADAPTER_TEST_DIR/request.json"
+    ! grep -q 'sk-ant-secret-value' "$ADAPTER_TEST_DIR/argv" &&
+    ! grep -q 'sk-ant-secret-value' "$ADAPTER_TEST_DIR/config.toml" &&
+    assert_eq set "$(cat "$ADAPTER_TEST_DIR/key-state")" &&
+    ! grep -q '=x$' "$ADAPTER_TEST_DIR/env" &&
+    grep -q '^model_provider = "anyrouter"$' "$ADAPTER_TEST_DIR/config.toml" &&
+    grep -q '^model = "gpt-test"$' "$ADAPTER_TEST_DIR/config.toml" &&
+    grep -q '^wire_api = "responses"$' "$ADAPTER_TEST_DIR/config.toml" &&
+    grep -q '^base_url = "https://anyrouter.top/v1"$' "$ADAPTER_TEST_DIR/config.toml" &&
+    assert_contains "$(cat "$ADAPTER_TEST_DIR/argv")" 'exec' &&
+    assert_contains "$(cat "$ADAPTER_TEST_DIR/argv")" '--ephemeral' &&
+    assert_contains "$(cat "$ADAPTER_TEST_DIR/argv")" '--skip-git-repo-check' &&
+    assert_contains "$(cat "$ADAPTER_TEST_DIR/argv")" '--sandbox read-only' &&
+    assert_contains "$(cat "$ADAPTER_TEST_DIR/argv")" '--model gpt-test' &&
+    [ "$(cat "$ADAPTER_TEST_DIR/home")" != "$ADAPTER_TEST_DIR/original-home" ] &&
+    [ "$(cat "$ADAPTER_TEST_DIR/codex-home")" != "$ADAPTER_TEST_DIR/original-home" ]
+  local assertion_status=$?
+  rm -rf "$ADAPTER_TEST_DIR"
+  return "$assertion_status"
+}
+
+test_gpt_adapter_rejects_legacy_token_argument() {
+  setup_adapter_fixture || return
+  write_fake_codex
+  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_EXIT=0 CODEX_STDOUT='must not run' CODEX_STDERR=''
+  local output status
+  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" ANYROUTER_TOKEN='environment-test-token' \
+    bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
+    'argv-secret-token' 'https://anyrouter.top/v1' 'gpt-test' 'Review code' 2>&1)"
+  status=$?
+  [ "$status" -eq 2 ] && [ ! -e "$ADAPTER_TEST_DIR/argv" ] &&
+    assert_not_contains "$output" 'argv-secret-token' &&
+    assert_not_contains "$output" 'environment-test-token'
   local assertion_status=$?
   rm -rf "$ADAPTER_TEST_DIR"
   return "$assertion_status"
@@ -595,26 +603,28 @@ test_gpt_adapter_success_and_json() {
 
 test_gpt_adapter_rate_limit() {
   setup_adapter_fixture || return
-  write_fake_curl
-  export CURL_HTTP_CODE=429 CURL_BODY='{"error":{"message":"busy secret response"}}'
+  write_fake_codex
+  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_EXIT=1 CODEX_STDOUT='' CODEX_STDERR='HTTP 429 busy secret response'
   local output status
-  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
-    'sk-ant-secret-value' 'https://anyrouter.top/v1' 'gpt-test' 'Review code' 2>&1)"
+  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" ANYROUTER_TOKEN='sk-ant-secret-value' \
+    bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
+    'https://anyrouter.top/v1' 'gpt-test' 'Review code' 2>&1)"
   status=$?
   rm -rf "$ADAPTER_TEST_DIR"
   [ "$status" -eq 0 ] && assert_contains "$output" 'status=rate_limited' &&
-    assert_contains "$output" 'http_code=429' &&
+    assert_contains "$output" 'http_code=000' &&
     assert_not_contains "$output" 'sk-ant-secret-value' &&
     assert_not_contains "$output" 'busy secret response'
 }
 
 test_gpt_adapter_invalid_model() {
   setup_adapter_fixture || return
-  write_fake_curl
-  export CURL_HTTP_CODE=400 CURL_BODY='{"error":{"code":"model_not_found","message":"private upstream detail"}}'
+  write_fake_codex
+  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_EXIT=1 CODEX_STDOUT='' CODEX_STDERR='unknown model private upstream detail'
   local output status
-  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
-    'sk-ant-secret-value' 'https://anyrouter.top/v1' 'gpt-test' 'Review code' 2>&1)"
+  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" ANYROUTER_TOKEN='sk-ant-secret-value' \
+    bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
+    'https://anyrouter.top/v1' 'gpt-test' 'Review code' 2>&1)"
   status=$?
   rm -rf "$ADAPTER_TEST_DIR"
   [ "$status" -eq 0 ] && assert_contains "$output" 'status=invalid' &&
@@ -624,11 +634,12 @@ test_gpt_adapter_invalid_model() {
 
 test_gpt_adapter_authentication_error_is_distinct() {
   setup_adapter_fixture || return
-  write_fake_curl
-  export CURL_HTTP_CODE=401 CURL_BODY='{"error":{"message":"private credential detail"}}'
+  write_fake_codex
+  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_EXIT=1 CODEX_STDOUT='' CODEX_STDERR='HTTP 401 private credential detail'
   local output status
-  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
-    'sk-ant-secret-value' 'https://anyrouter.top/v1' 'gpt-test' 'Review code' 2>&1)"
+  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" ANYROUTER_TOKEN='sk-ant-secret-value' \
+    bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
+    'https://anyrouter.top/v1' 'gpt-test' 'Review code' 2>&1)"
   status=$?
   rm -rf "$ADAPTER_TEST_DIR"
   [ "$status" -eq 0 ] && assert_contains "$output" 'status=invalid' &&
@@ -636,17 +647,18 @@ test_gpt_adapter_authentication_error_is_distinct() {
     assert_not_contains "$output" 'private credential detail'
 }
 
-test_gpt_adapter_maps_422_to_invalid() {
+test_gpt_adapter_request_configuration_error() {
   setup_adapter_fixture || return
-  write_fake_curl
-  export CURL_HTTP_CODE=422 CURL_BODY='{"error":{"message":"invalid parameter detail"}}'
+  write_fake_codex
+  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_EXIT=1 CODEX_STDOUT='' CODEX_STDERR='invalid parameter detail'
   local output status
-  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
-    'sk-ant-secret-value' 'https://anyrouter.top/v1' 'gpt-test' 'Review code' 2>&1)"
+  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" ANYROUTER_TOKEN='sk-ant-secret-value' \
+    bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
+    'https://anyrouter.top/v1' 'gpt-test' 'Review code' 2>&1)"
   status=$?
   rm -rf "$ADAPTER_TEST_DIR"
   [ "$status" -eq 0 ] && assert_contains "$output" 'status=invalid' &&
-    assert_contains "$output" 'http_code=422' &&
+    assert_contains "$output" 'http_code=000' &&
     assert_contains "$output" 'message=request_configuration_error' &&
     [[ "$output" =~ elapsed_sec=[0-9]+ ]] &&
     assert_not_contains "$output" 'invalid parameter detail'
@@ -654,16 +666,38 @@ test_gpt_adapter_maps_422_to_invalid() {
 
 test_gpt_adapter_network_failure() {
   setup_adapter_fixture || return
-  write_fake_curl
-  export CURL_HTTP_CODE=000 CURL_BODY='' CURL_EXIT=7
+  write_fake_codex
+  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_STDOUT='' CODEX_STDERR='transport failure' CODEX_EXIT=7
   local output status
-  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
-    'sk-ant-secret-value' 'https://anyrouter.top/v1' 'gpt-test' 'Review code' 2>&1)"
+  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" ANYROUTER_TOKEN='sk-ant-secret-value' \
+    bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
+    'https://anyrouter.top/v1' 'gpt-test' 'Review code' 2>&1)"
   status=$?
   rm -rf "$ADAPTER_TEST_DIR"
-  unset CURL_EXIT
   [ "$status" -eq 0 ] && assert_contains "$output" 'status=retryable' &&
     assert_contains "$output" 'http_code=000'
+}
+
+test_gpt_adapter_timeout_is_retryable() {
+  setup_adapter_fixture || return
+  cat > "$ADAPTER_TEST_DIR/bin/codex" <<'SH'
+#!/usr/bin/env bash
+/usr/bin/sleep 3
+printf '%s\n' 'late private response'
+SH
+  chmod +x "$ADAPTER_TEST_DIR/bin/codex"
+  local output status start_epoch elapsed
+  start_epoch="$(date +%s)"
+  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" REQUEST_TIMEOUT_SEC=1 \
+    ANYROUTER_TOKEN='sk-ant-secret-value' bash "$ROOT_DIR/scripts/adapters/gpt.sh" \
+    'https://anyrouter.top/v1' 'gpt-test' 'Review code' 2>&1)"
+  status=$?
+  elapsed=$(( $(date +%s) - start_epoch ))
+  rm -rf "$ADAPTER_TEST_DIR"
+  [ "$status" -eq 0 ] && [ "$elapsed" -lt 3 ] &&
+    assert_contains "$output" 'status=retryable' &&
+    assert_contains "$output" 'message=request_timeout' &&
+    assert_not_contains "$output" 'late private response'
 }
 
 write_fake_claude() {
@@ -741,41 +775,32 @@ test_claude_adapter_error_categories_are_distinct() {
 
 test_gpt_adapter_term_removes_private_config() {
   setup_adapter_fixture || return
-  cat > "$ADAPTER_TEST_DIR/bin/curl" <<'SH'
+  cat > "$ADAPTER_TEST_DIR/bin/codex" <<'SH'
 #!/usr/bin/env bash
 trap '' TERM INT
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --config|-K)
-      printf '%s\n' "$2" > "$ADAPTER_TEST_DIR/config.path"
-      stat -c '%a' "$2" > "$ADAPTER_TEST_DIR/config.mode"
-      shift 2
-      ;;
-    *) shift ;;
-  esac
-done
-printf '%s\n' "$BASHPID" > "$ADAPTER_TEST_DIR/fake-curl.pid"
+printf '%s\n' "$BASHPID" > "$ADAPTER_TEST_DIR/fake-codex.pid"
+printf '%s\n' "$CODEX_HOME" > "$ADAPTER_TEST_DIR/codex-home.path"
 /usr/bin/bash -c 'trap "" TERM INT; exec /usr/bin/sleep 30' &
-printf '%s\n' "$!" > "$ADAPTER_TEST_DIR/fake-curl-child.pid"
+printf '%s\n' "$!" > "$ADAPTER_TEST_DIR/fake-codex-child.pid"
 wait
 SH
-  chmod +x "$ADAPTER_TEST_DIR/bin/curl"
-  local pid curl_pid='' curl_child_pid='' config_path='' exited=false curl_exited=false child_exited=false status=0
-  PATH="$ADAPTER_TEST_DIR/bin:$PATH" TEST_TEMP_PATH_LOG="$ADAPTER_TEST_DIR/temp.paths" \
+  chmod +x "$ADAPTER_TEST_DIR/bin/codex"
+  local pid codex_pid='' codex_child_pid='' codex_home='' exited=false codex_exited=false child_exited=false status=0
+  PATH="$ADAPTER_TEST_DIR/bin:$PATH" CODEX_TEST_DIR="$ADAPTER_TEST_DIR" \
     ANYROUTER_TOKEN='sk-ant-secret-value' \
     bash "$ROOT_DIR/scripts/adapters/gpt.sh" 'https://anyrouter.top/v1' gpt-test 'Review code' \
     >"$ADAPTER_TEST_DIR/output" 2>&1 &
   pid=$!
   for _ in {1..30}; do
-    if [ -s "$ADAPTER_TEST_DIR/config.path" ] && [ -s "$ADAPTER_TEST_DIR/fake-curl.pid" ] && [ -s "$ADAPTER_TEST_DIR/fake-curl-child.pid" ]; then
-      config_path="$(cat "$ADAPTER_TEST_DIR/config.path")"
-      curl_pid="$(cat "$ADAPTER_TEST_DIR/fake-curl.pid")"
-      curl_child_pid="$(cat "$ADAPTER_TEST_DIR/fake-curl-child.pid")"
+    if [ -s "$ADAPTER_TEST_DIR/codex-home.path" ] && [ -s "$ADAPTER_TEST_DIR/fake-codex.pid" ] && [ -s "$ADAPTER_TEST_DIR/fake-codex-child.pid" ]; then
+      codex_home="$(cat "$ADAPTER_TEST_DIR/codex-home.path")"
+      codex_pid="$(cat "$ADAPTER_TEST_DIR/fake-codex.pid")"
+      codex_child_pid="$(cat "$ADAPTER_TEST_DIR/fake-codex-child.pid")"
       break
     fi
     /usr/bin/sleep 0.1
   done
-  [ -n "$config_path" ] && [ -n "$curl_pid" ] && [ -n "$curl_child_pid" ] || status=125
+  [ -n "$codex_home" ] && [ -n "$codex_pid" ] && [ -n "$codex_child_pid" ] || status=125
   kill -TERM "$pid" 2>/dev/null || true
   for _ in {1..30}; do
     if ! kill -0 "$pid" 2>/dev/null; then exited=true; break; fi
@@ -783,18 +808,16 @@ SH
   done
   if [ "$exited" = true ]; then wait "$pid" 2>/dev/null || true; else status=124; fi
   for _ in {1..30}; do
-    kill -0 "$curl_pid" 2>/dev/null || curl_exited=true
-    kill -0 "$curl_child_pid" 2>/dev/null || child_exited=true
-    [ "$curl_exited" = true ] && [ "$child_exited" = true ] && break
+    kill -0 "$codex_pid" 2>/dev/null || codex_exited=true
+    kill -0 "$codex_child_pid" 2>/dev/null || child_exited=true
+    [ "$codex_exited" = true ] && [ "$child_exited" = true ] && break
     /usr/bin/sleep 0.1
   done
-  [ "$curl_exited" = true ] && [ "$child_exited" = true ] || status=124
-  [ "$status" -eq 0 ] && assert_eq 600 "$(cat "$ADAPTER_TEST_DIR/config.mode")" &&
-    [ -s "$ADAPTER_TEST_DIR/temp.paths" ] &&
-    while IFS= read -r path; do [ ! -e "$path" ] || exit 1; done < "$ADAPTER_TEST_DIR/temp.paths" &&
-    ! kill -0 "$curl_pid" 2>/dev/null && ! kill -0 "$curl_child_pid" 2>/dev/null
+  [ "$codex_exited" = true ] && [ "$child_exited" = true ] || status=124
+  [ "$status" -eq 0 ] && [ ! -e "$codex_home" ] &&
+    ! kill -0 "$codex_pid" 2>/dev/null && ! kill -0 "$codex_child_pid" 2>/dev/null
   local assertion_status=$?
-  kill -KILL "$pid" "$curl_pid" "$curl_child_pid" 2>/dev/null || true
+  kill -KILL "$pid" "$codex_pid" "$codex_child_pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   rm -rf "$ADAPTER_TEST_DIR"
   return "$assertion_status"
@@ -893,18 +916,20 @@ SH
 }
 
 run_adapter_tests() {
-  run_case "GPT adapter sends valid JSON to one chat completions path" test_gpt_adapter_success_and_json
-  run_case "GPT adapter maps HTTP 429 without exposing the response" test_gpt_adapter_rate_limit
-  run_case "GPT adapter maps an explicit missing model to invalid" test_gpt_adapter_invalid_model
-  run_case "GPT adapter distinguishes authentication failures from model failures" test_gpt_adapter_authentication_error_is_distinct
-  run_case "GPT adapter maps HTTP 422 parameter errors to invalid" test_gpt_adapter_maps_422_to_invalid
-  run_case "GPT adapter maps transport failure to retryable" test_gpt_adapter_network_failure
+  run_case "GPT adapter uses an isolated token-free Codex Responses provider" test_gpt_adapter_success_and_json
+  run_case "GPT adapter rejects the legacy token-in-argv entrypoint" test_gpt_adapter_rejects_legacy_token_argument
+  run_case "GPT Codex adapter maps 429 without exposing CLI output" test_gpt_adapter_rate_limit
+  run_case "GPT Codex adapter maps an explicit missing model to invalid" test_gpt_adapter_invalid_model
+  run_case "GPT Codex adapter distinguishes authentication failures" test_gpt_adapter_authentication_error_is_distinct
+  run_case "GPT Codex adapter maps request configuration errors" test_gpt_adapter_request_configuration_error
+  run_case "GPT Codex adapter maps transport failure to retryable" test_gpt_adapter_network_failure
+  run_case "GPT Codex adapter bounds a blocked request with timeout" test_gpt_adapter_timeout_is_retryable
   run_case "Claude adapter uses an isolated HOME and root base URL" test_claude_adapter_isolated_success
   run_case "Claude adapter maps 429 without exposing CLI output" test_claude_adapter_rate_limit_is_safe
   run_case "Claude adapter distinguishes authentication and model failures" test_claude_adapter_error_categories_are_distinct
   run_case "Claude adapter bounds a blocked CLI call with timeout" test_claude_adapter_timeout_is_retryable
   run_case "SIGTERM directly cleans the Claude timeout tree and isolated HOME" test_claude_adapter_term_cleans_cli_tree_and_home
-  run_case "SIGTERM during a GPT request removes its private curl config" test_gpt_adapter_term_removes_private_config
+  run_case "SIGTERM cleans the GPT Codex process tree and isolated HOME" test_gpt_adapter_term_removes_private_config
 }
 
 setup_worker_fixture() {
@@ -972,6 +997,10 @@ test_worker_429_then_success_uses_both_intervals() {
     assert_eq 1 "$sleep_count" &&
     assert_eq 1 "$(grep -c '^gpt|success$' "$WORKER_EMAIL")" &&
     assert_eq 'Review this bounded queue implementation and identify one correctness risk.' "$(head -n 1 "$WORKER_TEST_DIR/prompt.log")" &&
+    assert_contains "$output" '[gpt] phase=probing model=gpt-test status=rate_limited http_code=200 elapsed_sec=0 message=test_result' &&
+    [[ "$output" =~ \[gpt\]\ phase=probing\ next_delay_sec=([3-9]|10) ]] &&
+    assert_contains "$output" '[gpt] phase=keepalive model=gpt-test status=success http_code=200 elapsed_sec=0 message=test_result' &&
+    assert_not_contains "$output" 'Review this bounded queue' &&
     assert_not_contains "$output" 'sk-ant-secret-worker' &&
     ! grep -q 'sk-ant-secret-worker' "$state_file"
   local assertion_status=$?
@@ -1059,6 +1088,8 @@ test_worker_invalid_tries_next_ranked_candidate() {
     assert_eq gpt-fallback "$(sed -n '2p' "$WORKER_TEST_DIR/model.log")" &&
     assert_eq 1 "$(grep -c '^gpt|success$' "$WORKER_EMAIL")" &&
     ! grep -q '^gpt|config_error$' "$WORKER_EMAIL" &&
+    assert_contains "$output" '[gpt] phase=probing model=gpt-new status=invalid http_code=200 elapsed_sec=0 message=model_or_protocol_error' &&
+    assert_contains "$output" '[gpt] phase=keepalive model=gpt-fallback status=success http_code=200 elapsed_sec=0 message=test_result' &&
     assert_not_contains "$output" 'sk-ant-secret-worker'
   local assertion_status=$?
   rm -rf "$WORKER_TEST_DIR"
@@ -1087,6 +1118,32 @@ SH
   [ "$status" -eq 0 ] && assert_eq keepalive "$(read_state_value "$state_file" phase)" &&
     assert_eq gpt-current "$(read_state_value "$state_file" model)" &&
     assert_eq gpt "$(cat "$WORKER_TEST_DIR/discovery.calls")" &&
+    assert_not_contains "$output" 'sk-ant-secret-worker'
+  local assertion_status=$?
+  rm -rf "$WORKER_TEST_DIR"
+  return "$assertion_status"
+}
+
+test_worker_dynamic_crlf_candidate_reaches_adapter_without_carriage_return() {
+  setup_worker_fixture || return
+  printf 'invalid|model_or_protocol_error\nsuccess\n' > "$WORKER_RESULTS"
+  printf 'gpt-inherited\n' > "$WORKER_TEST_DIR/candidates"
+  cat > "$WORKER_TEST_DIR/bin/fake-discover-crlf" <<'SH'
+#!/usr/bin/env bash
+printf 'gpt-test\r\n'
+SH
+  chmod +x "$WORKER_TEST_DIR/bin/fake-discover-crlf"
+  local state_file output status
+  state_file="$WORKER_TEST_DIR/gpt.state"
+  output="$(PATH="$WORKER_TEST_DIR/bin:$PATH" ADAPTER_COMMAND="$WORKER_TEST_DIR/bin/fake-adapter" \
+    SLEEP_COMMAND="$WORKER_TEST_DIR/bin/record-sleep" PROMPTS_FILE="$WORKER_PROMPTS" \
+    MODEL_CANDIDATES_FILE="$WORKER_TEST_DIR/candidates" MODEL_DISCOVERY_COMMAND="$WORKER_TEST_DIR/bin/fake-discover-crlf" \
+    ALLOW_MODEL_REDISCOVERY=true MAX_ITERATIONS=2 MAX_DURATION_SEC=60 EMAIL_LOG="$WORKER_EMAIL" \
+    CHAIN_ID=chain-test CHAIN_STARTED_EPOCH=123 bash "$ROOT_DIR/scripts/pool-worker.sh" \
+      gpt 'sk-ant-secret-worker' 'https://anyrouter.top/v1' gpt-inherited "$state_file" 2>&1)"
+  status=$?
+  [ "$status" -eq 0 ] && assert_eq gpt-test "$(sed -n '2p' "$WORKER_TEST_DIR/model.log")" &&
+    assert_eq gpt-test "$(read_state_value "$state_file" model)" &&
     assert_not_contains "$output" 'sk-ant-secret-worker'
   local assertion_status=$?
   rm -rf "$WORKER_TEST_DIR"
@@ -1411,6 +1468,7 @@ run_worker_tests() {
   run_case "invalid adapter result becomes config_error" test_worker_invalid_becomes_config_error
   run_case "invalid model advances to the next ranked candidate" test_worker_invalid_tries_next_ranked_candidate
   run_case "an invalid inherited relay model triggers one safe rediscovery" test_worker_rediscover_after_inherited_model_becomes_invalid
+  run_case "a CRLF-discovered model reaches the adapter without a carriage return" test_worker_dynamic_crlf_candidate_reaches_adapter_without_carriage_return
   run_case "authentication errors stop without trying another model" test_worker_authentication_error_never_advances_candidate
   run_case "adapter subprocess receives only the Anyrouter token secret" test_worker_adapter_receives_only_required_secret
   run_case "SMTP failure cannot undo a successful transition" test_worker_smtp_failure_does_not_change_success
@@ -2013,13 +2071,12 @@ setup_formal_dual_fixture() {
   cat > "$FORMAL_TEST_DIR/bin/curl" <<'SH'
 #!/usr/bin/env bash
 output_file=''
-data_file=''
 url=''
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --config|-K|-H|--header|--connect-timeout|--max-time|--write-out|-w) shift 2 ;;
     --output|-o) output_file="$2"; shift 2 ;;
-    --data-binary) data_file="${2#@}"; shift 2 ;;
+    --data-binary) shift 2 ;;
     --silent|--show-error|--fail|--location) shift ;;
     *) url="$1"; shift ;;
   esac
@@ -2029,23 +2086,21 @@ case "$url" in
     printf 'models\n' >> "$FORMAL_REQUESTS"
     if [ -n "$output_file" ]; then cp "$FORMAL_MODELS" "$output_file"; else cat "$FORMAL_MODELS"; fi
     ;;
-  */chat/completions)
-    model="$(python - "$data_file" <<'PY'
-import json, sys
-print(json.load(open(sys.argv[1], encoding="utf-8"))["model"])
-PY
-)"
-    printf 'gpt:%s\n' "$model" >> "$FORMAL_REQUESTS"
-    case "$model" in
-      *-rate) code=429; body='{"error":{"message":"busy"}}' ;;
-      *-auth) code=401; body='{"error":{"message":"unauthorized"}}' ;;
-      *-bad|*-stale) code=400; body='{"error":{"code":"model_not_found","message":"missing"}}' ;;
-      *) code=200; body='{"choices":[{"message":{"content":"safe response"}}]}' ;;
-    esac
-    [ -z "$output_file" ] || printf '%s' "$body" > "$output_file"
-    printf '%s' "$code"
-    ;;
   *) exit 97 ;;
+esac
+SH
+  cat > "$FORMAL_TEST_DIR/bin/codex" <<'SH'
+#!/usr/bin/env bash
+model=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in --model) model="$2"; shift 2 ;; *) shift ;; esac
+done
+printf 'gpt:%s\n' "$model" >> "$FORMAL_REQUESTS"
+case "$model" in
+  *-rate) printf 'HTTP 429' >&2; exit 1 ;;
+  *-auth) printf 'HTTP 401' >&2; exit 1 ;;
+  *-bad|*-stale) printf 'unknown model' >&2; exit 1 ;;
+  *) printf 'safe response' ;;
 esac
 SH
   cat > "$FORMAL_TEST_DIR/bin/claude" <<'SH'
@@ -2062,7 +2117,7 @@ case "$model" in
   *) printf 'safe response' ;;
 esac
 SH
-  chmod +x "$FORMAL_TEST_DIR/bin/curl" "$FORMAL_TEST_DIR/bin/claude"
+  chmod +x "$FORMAL_TEST_DIR/bin/curl" "$FORMAL_TEST_DIR/bin/claude" "$FORMAL_TEST_DIR/bin/codex"
 }
 
 run_formal_dual() {
@@ -2299,6 +2354,8 @@ test_workflows_enforce_stop_and_secret_boundaries() {
     grep -q 'https://anyrouter.top/v1' "$workflow" &&
     grep -q 'ANYROUTER_CLAUDE_MODEL' "$workflow" &&
     grep -q 'ANYROUTER_GPT_MODEL' "$workflow" &&
+    grep -q 'npm install -g @openai/codex' "$workflow" &&
+    grep -q 'codex --version' "$workflow" &&
     python - "$workflow" <<'PY'
 import pathlib, re, sys
 text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
@@ -2310,8 +2367,16 @@ assert secret_lines
 assert all(re.match(r"^ {10}(ANYROUTER_TOKENS|QQ_EMAIL|QQ_SMTP_AUTH_CODE):", lines[i]) for i in secret_lines)
 marker_i = next(i for i, line in enumerate(lines) if "Check stop marker" in line)
 install_i = next(i for i, line in enumerate(lines) if "Install Claude" in line)
+codex_i = next(i for i, line in enumerate(lines) if "Install Codex" in line)
+codex_verify_i = next(i for i, line in enumerate(lines) if "Verify Codex exec capabilities" in line)
 secret_i = min(secret_lines)
-assert marker_i < install_i < secret_i
+assert marker_i < install_i < codex_i < codex_verify_i < secret_i
+verify_start = codex_verify_i
+verify_run = next(i for i in range(verify_start + 1, len(lines)) if lines[i].strip() == "run: |")
+verify_body = "\n".join(lines[verify_run + 1:secret_i])
+assert "codex exec --help" in verify_body
+for flag in ("--ephemeral", "--skip-git-repo-check", "--sandbox", "--model"):
+    assert flag in verify_body
 assert "CHAIN_STARTED_EPOCH: ${{ steps.stop-check.outputs.chain_started_epoch }}" in text
 assert "CHAIN_ID: ${{ steps.stop-check.outputs.chain_id }}" in text
 PY
@@ -2386,13 +2451,30 @@ test_every_checkout_disables_persisted_credentials() {
 }
 
 test_once_and_legacy_workflows_use_new_entrypoints() {
-  grep -q 'https://anyrouter.top/v1' "$ROOT_DIR/.github/workflows/keepalive-once.yml" &&
-    grep -q 'run-dual-pool.sh.*--once' "$ROOT_DIR/.github/workflows/keepalive-once.yml" &&
-    grep -q 'ANYROUTER_CLAUDE_MODEL' "$ROOT_DIR/.github/workflows/keepalive-once.yml" &&
-    grep -q 'ANYROUTER_GPT_MODEL' "$ROOT_DIR/.github/workflows/keepalive-once.yml" &&
+  local once="$ROOT_DIR/.github/workflows/keepalive-once.yml"
+  grep -q 'https://anyrouter.top/v1' "$once" &&
+    grep -q 'run-dual-pool.sh.*--once' "$once" &&
+    grep -q 'ANYROUTER_CLAUDE_MODEL' "$once" &&
+    grep -q 'ANYROUTER_GPT_MODEL' "$once" &&
+    grep -q 'npm install -g @openai/codex' "$once" &&
+    grep -q 'codex --version' "$once" &&
+    python - "$once" <<'PY'
+import pathlib, sys
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+lines = text.splitlines()
+verify_i = next(i for i, line in enumerate(lines) if "Verify Codex exec capabilities" in line)
+secret_i = next(i for i, line in enumerate(lines) if "secrets.ANYROUTER_TOKENS" in line)
+assert verify_i < secret_i
+verify_run = next(i for i in range(verify_i + 1, len(lines)) if lines[i].strip() == "run: |")
+verify_body = "\n".join(lines[verify_run + 1:secret_i])
+assert "codex exec --help" in verify_body
+for flag in ("--ephemeral", "--skip-git-repo-check", "--sandbox", "--model"):
+    assert flag in verify_body
+PY
     grep -q 'https://anyrouter.top/v1' "$ROOT_DIR/.github/workflows/monitor-recovery.yml" &&
     grep -q 'Install Claude Code CLI' "$ROOT_DIR/.github/workflows/monitor-recovery.yml" &&
-    grep -q 'claude --version' "$ROOT_DIR/.github/workflows/monitor-recovery.yml"
+    grep -q 'claude --version' "$ROOT_DIR/.github/workflows/monitor-recovery.yml" &&
+    ! grep -q 'Install Codex CLI' "$ROOT_DIR/.github/workflows/monitor-recovery.yml"
 }
 
 test_auxiliary_workflows_use_minimum_permissions() {
@@ -2441,6 +2523,11 @@ test_readme_and_env_describe_dual_pool_controls() {
     grep -q '次日' "$ROOT_DIR/README.md" &&
     grep -q 'Variables' "$ROOT_DIR/README.md" &&
     grep -q 'legacy' "$ROOT_DIR/README.md" &&
+    grep -q 'Claude Code CLI' "$ROOT_DIR/README.md" &&
+    grep -q 'Codex CLI' "$ROOT_DIR/README.md" &&
+    grep -q 'Responses' "$ROOT_DIR/README.md" &&
+    grep -q 'model_or_protocol_error' "$ROOT_DIR/README.md" &&
+    grep -q '假.*codex' "$ROOT_DIR/README.md" &&
     grep -q '无法自动感知.*本地.*mode=stop' "$ROOT_DIR/README.md"
 }
 

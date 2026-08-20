@@ -114,6 +114,20 @@ jobs:
       - name: Verify Claude CLI
         if: steps.stop-check.outputs.should_run == 'true'
         run: claude --version
+      - name: Install Codex CLI
+        if: steps.stop-check.outputs.should_run == 'true'
+        run: npm install -g @openai/codex
+      - name: Verify Codex exec capabilities
+        if: steps.stop-check.outputs.should_run == 'true'
+        run: |
+          codex --version
+          codex_help="$(codex exec --help)"
+          for flag in --ephemeral --skip-git-repo-check --sandbox --model; do
+            grep -F -- "$flag" <<< "$codex_help" >/dev/null || {
+              printf 'Codex exec is missing required option: %s\n' "$flag" >&2
+              exit 1
+            }
+          done
       - name: Run dual pool chain
         if: steps.stop-check.outputs.should_run == 'true'
         env:
