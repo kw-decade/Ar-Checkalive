@@ -156,6 +156,9 @@ select_model() {
   if [ -n "$override" ]; then
     printf '%s\n' "$override" > "$candidates_file"
     printf '%s\n' "$override"
+  elif [ "$family" = claude ]; then
+    printf '%s\n' 'opus[1m]' > "$candidates_file"
+    printf '%s\n' 'opus[1m]'
   elif [ -n "$inherited" ]; then
     printf '%s\n' "$inherited" > "$candidates_file"
     printf '%s\n' "$inherited"
@@ -212,7 +215,7 @@ if [ "$once" = true ] && [ "$worker_iterations" -eq 0 ]; then worker_iterations=
 
 start_pool() {
   local pool="$1" model="$2" state_file="$3" candidates_file="$4" override="$5" rediscovery=false
-  [ -z "$override" ] && rediscovery=true
+  [ "$pool" = gpt ] && [ -z "$override" ] && rediscovery=true
   unset GITHUB_TOKEN ANYROUTER_TOKENS
   CHAIN_ID="$chain_id" CHAIN_STARTED_EPOCH="$chain_started_epoch" \
     MAX_DURATION_SEC="$max_duration" MAX_ITERATIONS="$worker_iterations" \

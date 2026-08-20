@@ -217,15 +217,16 @@ safe_log_value() {
 }
 
 log_result() {
-  local log_phase="$1" log_status="$2" log_http="$3" log_elapsed="$4" log_message="$5"
+  local log_phase="$1" log_status="$2" log_http="$3" log_elapsed="$4" log_cli_exit="$5" log_message="$6"
   [[ "$log_http" =~ ^[0-9]{3}$ ]] || log_http=000
   [[ "$log_elapsed" =~ ^[0-9]+$ ]] || log_elapsed=0
+  [[ "$log_cli_exit" =~ ^[0-9]+$ ]] || log_cli_exit=0
   case "$log_message" in
-    non_empty_response|empty_response|capacity_limited|authentication_error|model_or_protocol_error|request_configuration_error|request_timeout|cli_or_upstream_error|transport_error|upstream_error|unexpected_http_status|test_result) ;;
+    non_empty_response|empty_response|capacity_limited|authentication_error|model_or_protocol_error|request_configuration_error|request_timeout|cli_or_upstream_error|cli_command_unavailable|cli_argument_error|cli_configuration_error|transport_error|upstream_error|unexpected_http_status|test_result) ;;
     *) log_message=unspecified ;;
   esac
-  printf '[%s] phase=%s model=%s status=%s http_code=%s elapsed_sec=%s message=%s\n' \
-    "$pool" "$log_phase" "$(safe_log_value "$model")" "$log_status" "$log_http" "$log_elapsed" "$log_message"
+  printf '[%s] phase=%s model=%s status=%s http_code=%s elapsed_sec=%s cli_exit_code=%s message=%s\n' \
+    "$pool" "$log_phase" "$(safe_log_value "$model")" "$log_status" "$log_http" "$log_elapsed" "$log_cli_exit" "$log_message"
 }
 
 actions_url() {
@@ -305,11 +306,13 @@ while :; do
     message=cli_or_upstream_error
     http_code=000
     elapsed_sec=0
+    cli_exit_code="$adapter_exit"
   else
     status="$(result_value "$result" status)"
     message="$(result_value "$result" message)"
     http_code="$(result_value "$result" http_code)"
     elapsed_sec="$(result_value "$result" elapsed_sec)"
+    cli_exit_code="$(result_value "$result" cli_exit_code)"
     case "$status" in success|rate_limited|invalid|retryable) ;; *) status=retryable ;; esac
   fi
 
@@ -323,20 +326,20 @@ while :; do
       else
         persist_state
       fi
-      log_result "$phase" "$status" "$http_code" "$elapsed_sec" "$message"
+      log_result "$phase" "$status" "$http_code" "$elapsed_sec" "$cli_exit_code" "$message"
       ;;
     rate_limited)
       phase=probing
       notified=false
       persist_state
-      log_result "$phase" "$status" "$http_code" "$elapsed_sec" "$message"
+      log_result "$phase" "$status" "$http_code" "$elapsed_sec" "$cli_exit_code" "$message"
       ;;
     retryable)
       persist_state
-      log_result "$phase" "$status" "$http_code" "$elapsed_sec" "$message"
+      log_result "$phase" "$status" "$http_code" "$elapsed_sec" "$cli_exit_code" "$message"
       ;;
     invalid)
-      log_result "$phase" "$status" "$http_code" "$elapsed_sec" "$message"
+      log_result "$phase" "$status" "$http_code" "$elapsed_sec" "$cli_exit_code" "$message"
       if [ "$message" = model_or_protocol_error ] && advance_model_after_invalid; then
         iterations=$((iterations + 1))
         if [ "$MAX_ITERATIONS" -gt 0 ] && [ "$iterations" -ge "$MAX_ITERATIONS" ]; then break; fi

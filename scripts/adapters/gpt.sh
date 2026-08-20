@@ -18,11 +18,11 @@ base_url="$(normalize_base_url "$base_url_arg")"
 start_epoch="$(date +%s)"
 REQUEST_TIMEOUT_SEC="${REQUEST_TIMEOUT_SEC:-120}"
 [[ "$REQUEST_TIMEOUT_SEC" =~ ^[1-9][0-9]*$ ]] || {
-  printf 'status=invalid\nhttp_code=000\nelapsed_sec=0\nmessage=invalid_timeout_setting\n'
+  printf 'status=invalid\nhttp_code=000\nelapsed_sec=0\ncli_exit_code=0\nmessage=invalid_timeout_setting\n'
   exit 0
 }
 [[ "$model" =~ ^[A-Za-z0-9._:/+-]{1,128}$ ]] || {
-  printf 'status=invalid\nhttp_code=000\nelapsed_sec=0\nmessage=invalid_request\n'
+  printf 'status=invalid\nhttp_code=000\nelapsed_sec=0\ncli_exit_code=0\nmessage=invalid_request\n'
   exit 0
 }
 
@@ -92,20 +92,28 @@ set -e
 elapsed_sec="$(( $(date +%s) - start_epoch ))"
 if [ "$codex_status" -eq 0 ]; then
   if [ -s "$stdout_file" ]; then
-    printf 'status=success\nhttp_code=000\nelapsed_sec=%s\nmessage=non_empty_response\n' "$elapsed_sec"
+    printf 'status=success\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=0\nmessage=non_empty_response\n' "$elapsed_sec"
   else
-    printf 'status=retryable\nhttp_code=000\nelapsed_sec=%s\nmessage=empty_response\n' "$elapsed_sec"
+    printf 'status=retryable\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=0\nmessage=empty_response\n' "$elapsed_sec"
   fi
 elif [ "$codex_status" -eq 124 ]; then
-  printf 'status=retryable\nhttp_code=000\nelapsed_sec=%s\nmessage=request_timeout\n' "$elapsed_sec"
+  printf 'status=retryable\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=124\nmessage=request_timeout\n' "$elapsed_sec"
 elif grep -Eqi '(^|[^0-9])429([^0-9]|$)|rate[ _-]*limit|too many requests|capacity' "$stdout_file" "$stderr_file"; then
-  printf 'status=rate_limited\nhttp_code=000\nelapsed_sec=%s\nmessage=capacity_limited\n' "$elapsed_sec"
+  printf 'status=rate_limited\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=capacity_limited\n' "$elapsed_sec" "$codex_status"
 elif grep -Eqi '(^|[^0-9])(401|403)([^0-9]|$)|unauthorized|forbidden|authentication|invalid[ _-]*(token|api[ _-]*key)' "$stdout_file" "$stderr_file"; then
-  printf 'status=invalid\nhttp_code=000\nelapsed_sec=%s\nmessage=authentication_error\n' "$elapsed_sec"
+  printf 'status=invalid\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=authentication_error\n' "$elapsed_sec" "$codex_status"
 elif grep -Eqi 'unknown[ _-]*model|model.*(not found|does not exist|unsupported|not supported)|unsupported.*(model|protocol)|protocol.*(unsupported|not supported)' "$stdout_file" "$stderr_file"; then
-  printf 'status=invalid\nhttp_code=000\nelapsed_sec=%s\nmessage=model_or_protocol_error\n' "$elapsed_sec"
+  printf 'status=invalid\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=model_or_protocol_error\n' "$elapsed_sec" "$codex_status"
+elif [ "$codex_status" -eq 126 ] || [ "$codex_status" -eq 127 ] || grep -Eqi 'command not found|no such file or directory|not executable|cannot execute|permission denied' "$stdout_file" "$stderr_file"; then
+  printf 'status=retryable\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=cli_command_unavailable\n' "$elapsed_sec" "$codex_status"
+elif [ "$codex_status" -eq 2 ] || grep -Eqi 'unknown option|unrecognized option|invalid option|unexpected argument|usage:' "$stdout_file" "$stderr_file"; then
+  printf 'status=invalid\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=cli_argument_error\n' "$elapsed_sec" "$codex_status"
+elif grep -Eqi 'failed to (load|read|parse) (config|configuration|settings)|invalid (config|configuration|settings)|configuration (error|failed)|settings? (error|failed)|toml parse' "$stdout_file" "$stderr_file"; then
+  printf 'status=invalid\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=cli_configuration_error\n' "$elapsed_sec" "$codex_status"
+elif grep -Eqi 'tls|ssl|handshake|dns|could not resolve|connection (refused|reset|failed)|network|transport' "$stdout_file" "$stderr_file"; then
+  printf 'status=retryable\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=transport_error\n' "$elapsed_sec" "$codex_status"
 elif grep -Eqi 'bad request|invalid[ _-]*(request|argument|parameter)|missing[ _-]*(argument|parameter)' "$stdout_file" "$stderr_file"; then
-  printf 'status=invalid\nhttp_code=000\nelapsed_sec=%s\nmessage=request_configuration_error\n' "$elapsed_sec"
+  printf 'status=invalid\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=request_configuration_error\n' "$elapsed_sec" "$codex_status"
 else
-  printf 'status=retryable\nhttp_code=000\nelapsed_sec=%s\nmessage=cli_or_upstream_error\n' "$elapsed_sec"
+  printf 'status=retryable\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=%s\nmessage=cli_or_upstream_error\n' "$elapsed_sec" "$codex_status"
 fi

@@ -36,12 +36,12 @@ GitHub Actions 无法自动感知你是否已经在本地开始使用 Anyrouter�
 | `ANYROUTER_TOKENS` | Secret | 一个 key；兼容读取多行格式，但正式请求只使用第一条非空行 |
 | `QQ_EMAIL` | Secret | 可选，接收成功和配置错误提醒 |
 | `QQ_SMTP_AUTH_CODE` | Secret | 可选，QQ 邮箱 SMTP 授权码，不是登录密码 |
-| `ANYROUTER_CLAUDE_MODEL` | Variable | 可选覆盖；留空自动发现最新 Claude 文本模型 |
+| `ANYROUTER_CLAUDE_MODEL` | Variable | 可选覆盖；留空固定使用已验证的 Claude CLI 别名 `opus[1m]` |
 | `ANYROUTER_GPT_MODEL` | Variable | 可选覆盖；留空自动发现最新 GPT 文本模型 |
 
 默认地址是 `https://anyrouter.top/v1`。手动输入 `base_url` 时也会去掉多余的末尾斜杠，避免出现 `/v1/v1`。
 
-模型发现会从 `/models` 过滤 Claude/GPT 家族，排除 embedding、image、audio、tts、transcribe、realtime 等非聊天模型，并按可识别版本确定性排序。Variables 只在你想固定模型时填写。
+GPT 模型会从 `/models` 过滤 GPT 家族，排除 embedding、image、audio、tts、transcribe、realtime 等非聊天模型，并按可识别版本确定性排序。Claude 默认不从 `/models` 选择别名，而是使用已验证的 `opus[1m]`；只有填写 `ANYROUTER_CLAUDE_MODEL` 时才使用你的覆盖值。Variables 只在你想固定 GPT 模型或改用其他 Claude 别名时填写。
 
 ## 工作流
 
@@ -53,7 +53,11 @@ GitHub Actions 无法自动感知你是否已经在本地开始使用 Anyrouter�
 
 ## 怎么看 Actions 日志
 
-主循环每次请求只输出经过筛选的状态，不输出 prompt、key、模型回答或 CLI 原始报错。请求日志包含 `pool`（Claude/GPT 池）、`phase`（`probing` 挤号或 `keepalive` 保活）、`model`、`status`、`http_code`、`elapsed_sec` 和 `message`；等待日志还会显示 `next_delay_sec`。例如看到 `status=rate_limited message=capacity_limited`，表示该池仍在排队，稍后会继续尝试。
+主循环每次请求只输出经过筛选的状态，不输出 prompt、key、模型回答或 CLI 原始报错。请求日志包含 `pool`（Claude/GPT 池）、`phase`（`probing` 挤号或 `keepalive` 保活）、`model`、`status`、`http_code`、`elapsed_sec`、`cli_exit_code` 和 `message`；等待日志还会显示 `next_delay_sec`。例如看到 `status=rate_limited message=capacity_limited`，表示该池仍在排队，稍后会继续尝试。`cli_exit_code` 始终是非负整数；超时为 `124`，参数尚未启动 CLI 的本地校验结果为 `0`。
+
+Claude 和 GPT 的状态、`notified` 标记及成功邮件彼此独立：哪个池先从挤号进入保活，就立即只发送哪个池的邮件；另一个池继续自己的挤号或保活。邮件发送失败只记一条安全错误，不会回退池状态，也不会终止另一池或整个工作流。
+
+快速启动失败会只记录白名单诊断：`cli_command_unavailable`（命令不存在/不可执行）、`cli_argument_error`（CLI 参数错误）、`cli_configuration_error`（CLI 配置错误）或 `transport_error`（TLS/DNS/连接错误）。
 
 GPT 经 Codex CLI 调用时通常无法可靠取到上游 HTTP 状态码，所以日志中的 `http_code=000` 表示“CLI 没有提供可安全记录的状态码”，不是一次 HTTP 000 请求。`message=model_or_protocol_error` 表示当前模型不存在/不受支持，或者 Anyrouter 当前不兼容 Codex 使用的 Responses 协议。自动发现模型时会继续尝试下一个候选；如果你用 Variable 固定了模型，则应检查模型名，必要时清空 Variable 让它重新自动发现。若模型名确认无误却持续出现这个消息，需要确认 Anyrouter 的 `/v1/responses` 支持情况。
 
