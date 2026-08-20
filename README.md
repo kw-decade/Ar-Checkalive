@@ -1,4 +1,4 @@
-# Anyrouter 双池挤号与保活
+# Anyrouter 
 
 本项目只面向 GitHub Actions。它使用一个 Anyrouter key，同时维护两个互不通用的请求池：Claude 池和 GPT 池。一个池拿到 429，不代表另一个池也能用，所以两边分别计时、重试、通知和保存阶段。
 
