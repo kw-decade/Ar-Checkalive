@@ -1,20 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -ge 4 ]; then
-  token="$1"
-  base_url_arg="$2"
-  model="$3"
-  prompt="$4"
-elif [ "$#" -ge 3 ] && [ -n "${ANYROUTER_TOKEN:-}" ]; then
-  token="$ANYROUTER_TOKEN"
-  base_url_arg="$1"
-  model="$2"
-  prompt="$3"
-else
+if [ "$#" -ne 3 ] || [ -z "${ANYROUTER_TOKEN:-}" ]; then
   printf 'Usage: %s BASE_URL MODEL PROMPT (token via ANYROUTER_TOKEN)\n' "$0" >&2
   exit 2
 fi
+token="$ANYROUTER_TOKEN"
+base_url_arg="$1"
+model="$2"
+prompt="$3"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/common.sh
@@ -27,58 +21,39 @@ REQUEST_TIMEOUT_SEC="${REQUEST_TIMEOUT_SEC:-120}"
   printf 'status=invalid\nhttp_code=000\nelapsed_sec=0\ncli_exit_code=0\nmessage=invalid_timeout_setting\n'
   exit 0
 }
+
+# Anyrouter 的 Claude 通道要求 1M 上下文。Claude Code 的做法是：
+# `--model opus[1m]` 这类别名 → CLI 读 ANTHROPIC_DEFAULT_OPUS_MODEL 拿真实 id → 走 1M 分支。
+# 所以：传进来的是别名（含 '['）就原样用；是完整 id 就按 tier 塞进对应 env，并把 --model 换成 "<tier>[1m]"。
+cli_model="$model"
+default_model_env=''
+default_model_value=''
+if [[ "$model" != *'['* ]]; then
+  model_lower="${model,,}"
+  case "$model_lower" in
+    *fable*) tier=fable ;;
+    *sonnet*) tier=sonnet ;;
+    *haiku*) tier=haiku ;;
+    *) tier=opus ;;
+  esac
+  if [ "$model_lower" = "$tier" ]; then
+    # 裸别名 "opus"/"fable" 等：CLI 自己会解析，只补 [1m]
+    cli_model="${tier}[1m]"
+  else
+    cli_model="${tier}[1m]"
+    default_model_env="ANTHROPIC_DEFAULT_${tier^^}_MODEL"
+    default_model_value="${model}[1M]"
+  fi
+fi
+
 isolated_home="$(mktemp -d)"
 stdout_file="$isolated_home/stdout"
 stderr_file="$isolated_home/stderr"
 claude_pid=''
-fable_model_env="${ANTHROPIC_DEFAULT_FABLE_MODEL:-}"
-fable_name_env="${ANTHROPIC_DEFAULT_FABLE_MODEL_NAME:-}"
-model_lower="${model,,}"
-if [ "$model_lower" = 'fable[1m]' ]; then
-  fable_model_env='claude-fable-5[1M]'
-  fable_name_env='claude-fable-5'
-elif [ "$model_lower" = fable ]; then
-  fable_model_env='claude-fable-5'
-  fable_name_env='claude-fable-5'
-elif [[ "$model_lower" == claude-fable-* ]]; then
-  fable_name_env="${model%\[1M\]}"
-  fable_name_env="${fable_name_env%\[1m\]}"
-  fable_model_env="$model"
-fi
 mkdir -p "$isolated_home/.claude"
 
-cleanup_claude_home() {
-  rm -rf "$isolated_home"
-}
-
-stop_claude_process_tree() {
-  local pid="${1:-}" child children='' i exited=false
-  [ -n "$pid" ] || return 0
-  if [ -r "/proc/$pid/task/$pid/children" ]; then
-    children="$(cat "/proc/$pid/task/$pid/children" 2>/dev/null || true)"
-  else
-    children="$(ps -ef 2>/dev/null | awk -v parent="$pid" '$3 == parent { print $2 }')"
-  fi
-  for child in $children; do stop_claude_process_tree "$child"; done
-  kill -TERM "$pid" 2>/dev/null || true
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    if ! kill -0 "$pid" 2>/dev/null; then exited=true; break; fi
-    sleep 0.1
-  done
-  [ "$exited" = true ] || kill -KILL "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-}
-
-on_claude_signal() {
-  trap - TERM INT
-  stop_claude_process_tree "$claude_pid"
-  claude_pid=''
-  cleanup_claude_home
-  exit 143
-}
-
-trap cleanup_claude_home EXIT
-trap on_claude_signal TERM INT
+trap 'rm -rf "$isolated_home"' EXIT
+trap 'trap - TERM INT; kill_tree "$claude_pid"; rm -rf "$isolated_home"; exit 143' TERM INT
 
 classify_claude_failure() {
   local fallback_message="$1"
@@ -109,20 +84,27 @@ classify_claude_failure() {
   fi
 }
 
+# 通过 env 数组把可选的 ANTHROPIC_DEFAULT_*_MODEL 传进去；为空就不设。
+extra_env=()
+[ -z "$default_model_env" ] || extra_env+=("$default_model_env=$default_model_value")
+
 set +e
+# 先清掉调用环境里可能存在的 Claude Code 配置（模型别名、API key），只保留我们显式给的。
 env -u GITHUB_TOKEN -u QQ_EMAIL -u QQ_SMTP_AUTH_CODE \
   -u ANYROUTER_TOKEN -u ANYROUTER_TOKENS \
+  -u ANTHROPIC_API_KEY -u ANTHROPIC_MODEL \
+  -u ANTHROPIC_DEFAULT_OPUS_MODEL -u ANTHROPIC_DEFAULT_SONNET_MODEL \
+  -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u ANTHROPIC_DEFAULT_FABLE_MODEL \
   HOME="$isolated_home" \
   USERPROFILE="$isolated_home" \
   XDG_CONFIG_HOME="$isolated_home/.config" \
   CLAUDE_CONFIG_DIR="$isolated_home/.claude" \
   CLAUDE_CODE_MAX_RETRIES=0 \
-  ANTHROPIC_DEFAULT_FABLE_MODEL="$fable_model_env" \
-  ANTHROPIC_DEFAULT_FABLE_MODEL_NAME="$fable_name_env" \
   ANTHROPIC_AUTH_TOKEN="$token" \
   ANTHROPIC_BASE_URL="$base_url" \
+  "${extra_env[@]}" \
   timeout --foreground --kill-after=5 "$REQUEST_TIMEOUT_SEC" \
-    claude -p "$prompt" --print --model "$model" --bare >"$stdout_file" 2>"$stderr_file" &
+    claude -p "$prompt" --print --model "$cli_model" --bare >"$stdout_file" 2>"$stderr_file" &
 claude_pid=$!
 wait "$claude_pid"
 claude_status=$?

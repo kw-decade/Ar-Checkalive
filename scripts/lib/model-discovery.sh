@@ -7,44 +7,21 @@ if ! declare -F normalize_base_url >/dev/null 2>&1; then
   source "$MODEL_DISCOVERY_DIR/common.sh"
 fi
 
-model_python() {
-  if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys' >/dev/null 2>&1; then
-    command -v python3
-  elif command -v python >/dev/null 2>&1 && python -c 'import sys' >/dev/null 2>&1; then
-    command -v python
-  else
-    printf '%s\n' 'Python is required for model discovery' >&2
-    return 1
-  fi
-}
-
+# discover_models FAMILY BASE_URL TOKEN [SELECTOR]
+# 从 /models 拉候选并排序输出（每行一个，最优在前）。
+# SELECTOR 语义：
+#   空                         → 该家族全部聊天模型
+#   含 '[' 或形如 claude-*/gpt-* → 别名或完整 id，原样返回不请求（用户明确指定就信用户）
+#   其他（如 "5.5"、"opus 5.5"）  → 去掉 -._ 后做包含匹配，命中集合再排序
+# 返回码：2 参数错，3 请求失败，4 无命中/无 python。
 discover_models() (
-  local family="${1:-}" base_url="${2:-}" token="${3:-}" override="${4:-}"
-  local json python_command curl_config='' response_file='' curl_pid='' status=0
-  cleanup_discovery() { rm -f "$curl_config" "$response_file"; }
-  stop_discovery_curl() {
-    local i
-    [ -n "$curl_pid" ] || return 0
-    kill -TERM -- "-$curl_pid" 2>/dev/null || kill -TERM "$curl_pid" 2>/dev/null || true
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-      kill -0 "$curl_pid" 2>/dev/null || break
-      sleep 0.1
-    done
-    kill -KILL -- "-$curl_pid" 2>/dev/null || kill -KILL "$curl_pid" 2>/dev/null || true
-    wait "$curl_pid" 2>/dev/null || true
-    curl_pid=''
-  }
-  on_discovery_signal() {
-    trap - TERM INT
-    stop_discovery_curl
-    cleanup_discovery
-    exit 143
-  }
-  trap cleanup_discovery EXIT
-  trap on_discovery_signal TERM INT
+  local family="${1:-}" base_url="${2:-}" token="${3:-}" selector="${4:-}"
+  local python_bin curl_config='' response_file='' curl_pid='' status=0
+  trap 'rm -f "$curl_config" "$response_file"' EXIT
+  trap 'trap - TERM INT; kill_tree "$curl_pid"; rm -f "$curl_config" "$response_file"; exit 143' TERM INT
   case "$family" in claude|gpt) ;; *) return 2 ;; esac
-  if [ -n "$override" ]; then
-    printf '%s\n' "$override"
+  if [[ "$selector" == *'['* || "$selector" =~ ^(claude|gpt)- ]]; then
+    printf '%s\n' "$selector"
     return 0
   fi
   umask 077
@@ -53,51 +30,55 @@ discover_models() (
   if [ -n "${TEST_TEMP_PATH_LOG:-}" ]; then printf '%s\n' "$curl_config" "$response_file" >> "$TEST_TEMP_PATH_LOG"; fi
   printf 'header = "Authorization: Bearer %s"\n' "$token" > "$curl_config"
   set +e
-  if [ "${DISABLE_SETSID:-false}" != true ] && command -v setsid >/dev/null 2>&1; then
-    setsid env -u GITHUB_TOKEN -u QQ_EMAIL -u QQ_SMTP_AUTH_CODE \
-      -u ANYROUTER_TOKEN -u ANYROUTER_TOKENS \
-      curl --silent --show-error --fail --max-time 20 \
-        --config "$curl_config" \
-        "$(normalize_base_url "$base_url")/models" >"$response_file" 2>/dev/null &
-  else
-    env -u GITHUB_TOKEN -u QQ_EMAIL -u QQ_SMTP_AUTH_CODE \
-      -u ANYROUTER_TOKEN -u ANYROUTER_TOKENS \
-      curl --silent --show-error --fail --max-time 20 \
-        --config "$curl_config" \
-        "$(normalize_base_url "$base_url")/models" >"$response_file" 2>/dev/null &
-  fi
+  env -u GITHUB_TOKEN -u QQ_EMAIL -u QQ_SMTP_AUTH_CODE \
+    -u ANYROUTER_TOKEN -u ANYROUTER_TOKENS \
+    curl --silent --show-error --fail --max-time 20 \
+      --config "$curl_config" \
+      "$(normalize_base_url "$base_url")/models" >"$response_file" 2>/dev/null &
   curl_pid=$!
   wait "$curl_pid" || status=$?
   curl_pid=''
   set -e
   if [ "$status" -ne 0 ]; then
-    printf '%s\n' 'Model discovery request failed' >&2
+    printf '%s\n' '拉取 /models 失败' >&2
     return 3
   fi
-  json="$(cat "$response_file")"
-  python_command="$(model_python)" || return 4
-  if ! printf '%s' "$json" | "$python_command" -c '
+  python_bin="$(py)" || return 4
+  if ! "$python_bin" - "$family" "$selector" "$response_file" <<'PY'
 import json, re, sys
 
-family = sys.argv[1]
+family, selector, response_path = sys.argv[1], sys.argv[2].strip(), sys.argv[3]
 excluded = ("embedding", "image", "audio", "tts", "transcribe", "realtime")
 unstable = ("preview", "beta", "experimental")
 try:
-    payload = json.load(sys.stdin)
-except (TypeError, ValueError):
+    with open(response_path, encoding="utf-8") as handle:
+        payload = json.load(handle)
+except (OSError, TypeError, ValueError):
     raise SystemExit(1)
 
-candidates = []
+ids = []
 for item in payload.get("data", []):
     model_id = item.get("id") if isinstance(item, dict) else None
-    if not isinstance(model_id, str) or not model_id:
-        continue
+    if isinstance(model_id, str) and model_id:
+        ids.append(model_id)
+
+def squash(text):
+    return re.sub(r"[-._\s]", "", text.lower())
+
+# ponytail: 语义匹配就是「去掉分隔符后的子串包含」。"5.5" -> "55"，
+# "claude-opus-5-5-20260301" -> "claudeopus5520260301"。够用；误命中靠 rank 的 tier 兜底。
+tokens = [squash(t) for t in re.split(r"[\s,]+", selector) if t]
+
+candidates = []
+for model_id in ids:
     lower = model_id.lower()
     if any(word in lower for word in excluded):
         continue
     if family == "claude" and "claude" not in lower:
         continue
     if family == "gpt" and not lower.startswith("gpt-"):
+        continue
+    if tokens and not all(t in squash(model_id) for t in tokens):
         continue
     candidates.append(model_id)
 
@@ -110,25 +91,21 @@ def rank(model_id):
     numbers = (numbers + (0,) * 8)[:8]
     tier = 0
     if family == "claude":
-        tier = 3 if "opus" in lower else 2 if "sonnet" in lower else 1 if "haiku" in lower else 0
+        tier = 4 if "fable" in lower else 3 if "opus" in lower else 2 if "sonnet" in lower else 1 if "haiku" in lower else 0
     elif not any(word in lower for word in ("mini", "nano")):
         tier = 1
+    # 有 selector 时 tier 优先（"5.5" 要选 opus 而不是 haiku）；无 selector 时版本号优先。
+    if tokens:
+        return (not any(word in lower for word in unstable), tier, numbers, max(dates, default=0), lower)
     return (not any(word in lower for word in unstable), numbers, max(dates, default=0), tier, lower)
 
 if not candidates:
     raise SystemExit(1)
 for model_id in sorted(set(candidates), key=rank, reverse=True):
     print(model_id)
-' "$family"; then
-    printf '%s\n' "No usable $family chat model found" >&2
+PY
+  then
+    printf '没有找到匹配的 %s 模型（选择器: %s）\n' "$family" "${selector:-无}" >&2
     return 4
   fi
 )
-
-discover_model() {
-  local model status=0
-  model="$(discover_models "$@" | sed -n '1p')" || status=$?
-  [ "$status" -eq 0 ] || return "$status"
-  [ -n "$model" ] || return 4
-  printf '%s\n' "$model"
-}
