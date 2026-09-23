@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -lt 4 ]; then
+# 用法: pool-worker.sh POOL BASE_URL MODEL STATE_FILE   （token 只走 ANYROUTER_TOKEN）
+if [ "$#" -ne 4 ] || [ -z "${ANYROUTER_TOKEN:-}" ]; then
   printf 'Usage: %s POOL BASE_URL MODEL STATE_FILE (token via ANYROUTER_TOKEN)\n' "$0" >&2
   exit 2
 fi
@@ -13,27 +14,29 @@ source "$SCRIPT_DIR/lib/common.sh"
 source "$SCRIPT_DIR/lib/model-discovery.sh"
 
 pool="$1"
-if [ "$#" -ge 5 ]; then
-  token="$2"
-  base_url_arg="$3"
-  model="$4"
-  state_file="$5"
-elif [ -n "${ANYROUTER_TOKEN:-}" ]; then
-  token="$ANYROUTER_TOKEN"
-  base_url_arg="$2"
-  model="$3"
-  state_file="$4"
-else
-  printf 'ANYROUTER_TOKEN is required\n' >&2
-  exit 2
-fi
-base_url="$(normalize_base_url "$base_url_arg")"
+token="$ANYROUTER_TOKEN"
+base_url="$(normalize_base_url "$2")"
+model="$3"
+state_file="$4"
 case "$pool" in claude|gpt) ;; *) printf 'Unknown pool\n' >&2; exit 2 ;; esac
 
 PROBE_MIN_SEC="${PROBE_MIN_SEC:-3}"
 PROBE_MAX_SEC="${PROBE_MAX_SEC:-10}"
-KEEPALIVE_MIN_SEC="${KEEPALIVE_MIN_SEC:-30}"
-KEEPALIVE_MAX_SEC="${KEEPALIVE_MAX_SEC:-120}"
+# KEEPALIVE_SEC: 空 → 默认 180–300 秒随机；"0" → 不保活，成功通知后该池结束；
+# 单个数字 N → 固定 N 秒；"A-B" → A 到 B 秒随机。
+KEEPALIVE_SEC="${KEEPALIVE_SEC:-}"
+KEEPALIVE_MIN_SEC="${KEEPALIVE_MIN_SEC:-180}"
+KEEPALIVE_MAX_SEC="${KEEPALIVE_MAX_SEC:-300}"
+keepalive_enabled=true
+if [ "$KEEPALIVE_SEC" = 0 ]; then
+  keepalive_enabled=false
+elif [[ "$KEEPALIVE_SEC" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+  KEEPALIVE_MIN_SEC="${BASH_REMATCH[1]}"; KEEPALIVE_MAX_SEC="${BASH_REMATCH[2]}"
+elif [[ "$KEEPALIVE_SEC" =~ ^[0-9]+$ ]]; then
+  KEEPALIVE_MIN_SEC="$KEEPALIVE_SEC"; KEEPALIVE_MAX_SEC="$KEEPALIVE_SEC"
+elif [ -n "$KEEPALIVE_SEC" ]; then
+  printf 'KEEPALIVE_SEC 格式无效（应为 0、N 或 A-B）\n' >&2; exit 2
+fi
 MAX_DURATION_SEC="${MAX_DURATION_SEC:-17400}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-0}"
 PROMPTS_FILE="${PROMPTS_FILE:-$SCRIPT_DIR/prompts.txt}"
@@ -55,6 +58,30 @@ done
 mapfile -t prompts < <(awk 'NF && $0 !~ /^[[:space:]]*#/' "$PROMPTS_FILE")
 [ "${#prompts[@]}" -gt 0 ] || { printf 'Prompt file has no usable entries\n' >&2; exit 2; }
 
+# ---------- 中文映射表：只用于人看的日志/邮件，state 文件和 relay 仍用英文 ----------
+declare -A POOL_CN=([claude]='Claude池' [gpt]='GPT池')
+declare -A PHASE_CN=([probing]='探测中' [keepalive]='保活中' [config_error]='配置错误' [stopped]='已停止' [done]='已完成')
+declare -A STATUS_CN=([success]='成功' [rate_limited]='限流' [retryable]='可重试' [invalid]='无效')
+declare -A MESSAGE_CN=(
+  [non_empty_response]='收到回复'
+  [empty_response]='空回复'
+  [capacity_limited]='容量受限'
+  [authentication_error]='鉴权失败'
+  [model_or_protocol_error]='模型不存在或协议不兼容'
+  [request_configuration_error]='请求参数错误'
+  [request_timeout]='请求超时'
+  [cli_or_upstream_error]='CLI或上游错误'
+  [cli_command_unavailable]='CLI命令不可用'
+  [cli_argument_error]='CLI参数错误'
+  [cli_configuration_error]='CLI配置错误'
+  [transport_error]='网络错误'
+  [response_stream_error]='响应流中断'
+  [upstream_error]='上游错误'
+  [unexpected_http_status]='意外HTTP状态'
+  [test_result]='测试结果'
+)
+pool_cn="${POOL_CN[$pool]}"
+
 state_or_default() {
   local key="$1" default="$2" value
   value="$(read_state_value "$state_file" "$key" 2>/dev/null || true)"
@@ -65,13 +92,14 @@ phase="$(state_or_default phase probing)"
 notified="$(state_or_default notified false)"
 [ -n "$CHAIN_ID" ] || CHAIN_ID="$(state_or_default chain_id '')"
 [ "$CHAIN_STARTED_EPOCH" != 0 ] || CHAIN_STARTED_EPOCH="$(state_or_default chain_started_epoch 0)"
-case "$phase" in probing|keepalive|config_error|stopped) ;; *) phase=probing ;; esac
+case "$phase" in probing|keepalive|config_error|stopped|done) ;; *) phase=probing ;; esac
 case "$notified" in true|false) ;; *) notified=false ;; esac
 
 persist_state() {
   write_state_file "$state_file" "$phase" "$model" "$notified" "$CHAIN_ID" "$CHAIN_STARTED_EPOCH"
 }
 
+# ---------- 模型候选：invalid 时依次换下一个 ----------
 model_candidates=()
 model_candidate_index=0
 model_candidates_loaded=false
@@ -79,20 +107,16 @@ model_candidates_rediscovered=false
 
 discover_candidate_list() {
   local candidate_output status=0
+  set +e
   if [ -n "$MODEL_DISCOVERY_COMMAND" ]; then
-    set +e
     candidate_output="$(env -u GITHUB_TOKEN -u QQ_EMAIL -u QQ_SMTP_AUTH_CODE -u ANYROUTER_TOKENS \
       ANYROUTER_TOKEN="$token" "$MODEL_DISCOVERY_COMMAND" "$pool" "$base_url" "$MODEL_OVERRIDE" 2>/dev/null)"
-    status=$?
-    set -e
-    [ "$status" -eq 0 ] || return 1
   else
-    set +e
     candidate_output="$(discover_models "$pool" "$base_url" "$token" "$MODEL_OVERRIDE" 2>/dev/null)"
-    status=$?
-    set -e
-    [ "$status" -eq 0 ] || return 1
   fi
+  status=$?
+  set -e
+  [ "$status" -eq 0 ] || return 1
   candidate_output="${candidate_output//$'\r'/}"
   mapfile -t model_candidates <<< "$candidate_output"
   model_candidate_index=0
@@ -135,62 +159,21 @@ next_model_candidate() {
 
 advance_model_after_invalid() {
   [ "$ALLOW_MODEL_REDISCOVERY" = true ] || return 1
-  [ -z "$MODEL_OVERRIDE" ] || return 1
   load_model_candidates || return 1
   next_model_candidate && return 0
   rediscover_model_candidates || return 1
   next_model_candidate
 }
 
+# ---------- 进程与信号 ----------
 adapter_pid=''
 sleep_pid=''
 adapter_result_file="$(mktemp)"
-adapter_pgid=''
-
-cleanup_worker() {
-  rm -f "$adapter_result_file"
-}
-
-stop_tracked_process() {
-  local pid="$1" i exited=false
-  [ -n "$pid" ] || return 0
-  kill "$pid" 2>/dev/null || true
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    if ! kill -0 "$pid" 2>/dev/null; then exited=true; break; fi
-    sleep 0.1
-  done
-  [ "$exited" = true ] || kill -KILL "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-}
-
-stop_adapter_tree() {
-  local pid="$1" child children='' i exited=false
-  [ -n "$pid" ] || return 0
-  if [ -r "/proc/$pid/task/$pid/children" ]; then
-    children="$(cat "/proc/$pid/task/$pid/children" 2>/dev/null || true)"
-    for child in $children; do
-      [ -n "$child" ] || continue
-      stop_adapter_tree "$child"
-    done
-  else
-    children="$(ps -ef 2>/dev/null | awk -v parent="$pid" '$3 == parent { print $2 }')"
-    for child in $children; do
-      stop_adapter_tree "$child"
-    done
-  fi
-  kill -TERM "$pid" 2>/dev/null || true
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    if ! kill -0 "$pid" 2>/dev/null; then exited=true; break; fi
-    sleep 0.1
-  done
-  [ "$exited" = true ] || kill -KILL "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-}
 
 stop_worker() {
   trap - INT TERM
-  stop_adapter_tree "$adapter_pid"
-  stop_tracked_process "$sleep_pid"
+  kill_tree "$adapter_pid"
+  kill_tree "$sleep_pid"
   adapter_pid=''
   sleep_pid=''
   phase=stopped
@@ -198,20 +181,12 @@ stop_worker() {
   exit 0
 }
 trap stop_worker INT TERM
-trap cleanup_worker EXIT
+trap 'rm -f "$adapter_result_file"' EXIT
 
 persist_state
-case "$phase" in config_error|stopped) exit 0 ;; esac
+case "$phase" in config_error|stopped|done) exit 0 ;; esac
 
-pick_prompt() {
-  printf '%s\n' "${prompts[RANDOM % ${#prompts[@]}]}"
-}
-
-result_value() {
-  local result="$1" key="$2"
-  awk -F= -v wanted="$key" '$1 == wanted { sub(/^[^=]*=/, ""); print; exit }' <<< "$result"
-}
-
+# ---------- 日志 / 通知 ----------
 safe_log_value() {
   printf '%s' "$1" | tr '\r\n' '  ' | tr -cd '[:alnum:]_.:/+\[\]-' | cut -c1-96
 }
@@ -221,19 +196,17 @@ log_result() {
   [[ "$log_http" =~ ^[0-9]{3}$ ]] || log_http=000
   [[ "$log_elapsed" =~ ^[0-9]+$ ]] || log_elapsed=0
   [[ "$log_cli_exit" =~ ^[0-9]+$ ]] || log_cli_exit=0
-  case "$log_message" in
-    non_empty_response|empty_response|capacity_limited|authentication_error|model_or_protocol_error|request_configuration_error|request_timeout|cli_or_upstream_error|cli_command_unavailable|cli_argument_error|cli_configuration_error|transport_error|response_stream_error|upstream_error|unexpected_http_status|test_result) ;;
-    *) log_message=unspecified ;;
-  esac
-  printf '[%s] phase=%s model=%s status=%s http_code=%s elapsed_sec=%s cli_exit_code=%s message=%s\n' \
-    "$pool" "$log_phase" "$(safe_log_value "$model")" "$log_status" "$log_http" "$log_elapsed" "$log_cli_exit" "$log_message"
+  printf '[%s] 阶段=%s 模型=%s 状态=%s HTTP=%s 耗时=%s秒 CLI退出码=%s 原因=%s\n' \
+    "$pool_cn" "${PHASE_CN[$log_phase]:-未知}" "$(safe_log_value "$model")" \
+    "${STATUS_CN[$log_status]:-未知}" "$log_http" "$log_elapsed" "$log_cli_exit" \
+    "${MESSAGE_CN[$log_message]:-未分类}"
 }
 
 actions_url() {
   if [ -n "${GITHUB_SERVER_URL:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ] && [ -n "${GITHUB_RUN_ID:-}" ]; then
     printf '%s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
   else
-    printf '%s\n' 'Actions run URL unavailable'
+    printf '%s\n' '（无 Actions 链接）'
   fi
 }
 
@@ -247,26 +220,26 @@ notify_event() {
   [ "$DRY_RUN" != true ] || return 0
   case "$event" in
     success)
-      subject="Anyrouter ${pool} pool is available"
-      body="Pool: $pool
-Model: $model
-Status: available
-Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-Action: $(actions_url)
-Use the workflow stop mode when you want to end keepalive."
+      subject="Anyrouter ${pool_cn} 已可用"
+      body="池：$pool_cn
+模型：$model
+状态：可用
+时间：$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+Actions：$(actions_url)
+不需要继续保活时，在 Actions 里以 mode=stop 运行一次 workflow。"
       ;;
     config_error)
-      subject="Anyrouter ${pool} pool configuration error"
-      body="Pool: $pool
-Model: $model
-Status: configuration error
-Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-Action: $(actions_url)"
+      subject="Anyrouter ${pool_cn} 配置错误"
+      body="池：$pool_cn
+模型：$model
+状态：配置错误
+时间：$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+Actions：$(actions_url)"
       ;;
     *) return 2 ;;
   esac
   if ! send_email_safe "$subject" "$body"; then
-    printf '%s notification email failed\n' "$pool" >&2
+    printf '[%s] 通知邮件发送失败\n' "$pool_cn" >&2
   fi
 }
 
@@ -277,7 +250,7 @@ sleep_for_phase() {
   else
     delay="$(random_between "$PROBE_MIN_SEC" "$PROBE_MAX_SEC")"
   fi
-  printf '[%s] phase=%s next_delay_sec=%s\n' "$pool" "$phase" "$delay"
+  printf '[%s] 阶段=%s 下次等待=%s秒\n' "$pool_cn" "${PHASE_CN[$phase]}" "$delay"
   "$SLEEP_COMMAND" "$delay" &
   sleep_pid=$!
   wait "$sleep_pid" || sleep_status=$?
@@ -285,6 +258,7 @@ sleep_for_phase() {
   [ "$sleep_status" -eq 0 ]
 }
 
+# ---------- 主循环 ----------
 start_epoch="$(date +%s)"
 iterations=0
 while :; do
@@ -292,7 +266,7 @@ while :; do
   [ $((now_epoch - start_epoch)) -lt "$MAX_DURATION_SEC" ] || break
   if [ "$MAX_ITERATIONS" -gt 0 ] && [ "$iterations" -ge "$MAX_ITERATIONS" ]; then break; fi
 
-  prompt="$(pick_prompt)"
+  prompt="${prompts[RANDOM % ${#prompts[@]}]}"
   adapter_exit=0
   : > "$adapter_result_file"
   env -u GITHUB_TOKEN -u QQ_EMAIL -u QQ_SMTP_AUTH_CODE -u ANYROUTER_TOKENS \
@@ -302,23 +276,19 @@ while :; do
   adapter_pid=''
   result="$(cat "$adapter_result_file")"
   if [ "$adapter_exit" -ne 0 ]; then
-    status=retryable
-    message=cli_or_upstream_error
-    http_code=000
-    elapsed_sec=0
-    cli_exit_code="$adapter_exit"
+    status=retryable message=cli_or_upstream_error http_code=000 elapsed_sec=0 cli_exit_code="$adapter_exit"
   else
-    status="$(result_value "$result" status)"
-    message="$(result_value "$result" message)"
-    http_code="$(result_value "$result" http_code)"
-    elapsed_sec="$(result_value "$result" elapsed_sec)"
-    cli_exit_code="$(result_value "$result" cli_exit_code)"
+    status="$(awk -F= '$1 == "status" { print $2; exit }' <<< "$result")"
+    message="$(awk -F= '$1 == "message" { print $2; exit }' <<< "$result")"
+    http_code="$(awk -F= '$1 == "http_code" { print $2; exit }' <<< "$result")"
+    elapsed_sec="$(awk -F= '$1 == "elapsed_sec" { print $2; exit }' <<< "$result")"
+    cli_exit_code="$(awk -F= '$1 == "cli_exit_code" { print $2; exit }' <<< "$result")"
     case "$status" in success|rate_limited|invalid|retryable) ;; *) status=retryable ;; esac
   fi
 
   case "$status" in
     success)
-      phase=keepalive
+      if [ "$keepalive_enabled" = true ]; then phase=keepalive; else phase=done; fi
       if [ "$notified" != true ]; then
         notified=true
         persist_state
@@ -327,6 +297,7 @@ while :; do
         persist_state
       fi
       log_result "$phase" "$status" "$http_code" "$elapsed_sec" "$cli_exit_code" "$message"
+      [ "$phase" != done ] || break
       ;;
     rate_limited)
       phase=probing
@@ -341,6 +312,7 @@ while :; do
     invalid)
       log_result "$phase" "$status" "$http_code" "$elapsed_sec" "$cli_exit_code" "$message"
       if [ "$message" = model_or_protocol_error ] && advance_model_after_invalid; then
+        printf '[%s] 换用下一个候选模型：%s\n' "$pool_cn" "$(safe_log_value "$model")"
         iterations=$((iterations + 1))
         if [ "$MAX_ITERATIONS" -gt 0 ] && [ "$iterations" -ge "$MAX_ITERATIONS" ]; then break; fi
         continue

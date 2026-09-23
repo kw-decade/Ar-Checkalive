@@ -76,6 +76,7 @@ jobs:
       ANYROUTER_BASE_URL: ${{ inputs.base_url || 'https://anyrouter.top/v1' }}
       ANYROUTER_CLAUDE_MODEL: ${{ vars.ANYROUTER_CLAUDE_MODEL }}
       ANYROUTER_GPT_MODEL: ${{ vars.ANYROUTER_GPT_MODEL }}
+      KEEPALIVE_SEC: ${{ vars.ANYROUTER_KEEPALIVE_SEC }}
       CLAUDE_PHASE: ${{ inputs.claude_phase }}
       GPT_PHASE: ${{ inputs.gpt_phase }}
       CLAUDE_MODEL: ${{ inputs.claude_model }}

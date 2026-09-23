@@ -9,7 +9,7 @@ write_marker() {
   local marker_file="$1" stop_before_epoch="$2" py
   [[ "$stop_before_epoch" =~ ^[0-9]+$ ]] || return 2
   mkdir -p "$(dirname "$marker_file")"
-  py="$(python_command)"
+  py="$(py)"
   "$py" - "$marker_file" "$stop_before_epoch" <<'PY'
 import json, sys
 
@@ -24,12 +24,12 @@ cancel_runs() {
   local status=0
   [[ "$delay" =~ ^[0-9]+$ ]] || return 2
   cancel_active_workflow_runs || {
-    printf '%s\n' 'First cancel scan failed.' >&2
+    printf '%s\n' '第一次取消扫描失败。' >&2
     status=1
   }
   sleep "$delay"
   cancel_active_workflow_runs || {
-    printf '%s\n' 'Second cancel scan failed.' >&2
+    printf '%s\n' '第二次取消扫描失败。' >&2
     status=1
   }
   return "$status"

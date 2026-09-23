@@ -34,34 +34,10 @@ stderr_file="$isolated_home/stderr"
 config_file="$isolated_home/config.toml"
 mkdir -p "$isolated_home/.config"
 
-cleanup_gpt_home() { rm -rf "$isolated_home"; }
-stop_gpt_process_tree() {
-  local pid="${1:-}" child children='' i exited=false
-  [ -n "$pid" ] || return 0
-  if [ -r "/proc/$pid/task/$pid/children" ]; then
-    children="$(cat "/proc/$pid/task/$pid/children" 2>/dev/null || true)"
-  else
-    children="$(ps -ef 2>/dev/null | awk -v parent="$pid" '$3 == parent { print $2 }')"
-  fi
-  for child in $children; do stop_gpt_process_tree "$child"; done
-  kill -TERM "$pid" 2>/dev/null || true
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    if ! kill -0 "$pid" 2>/dev/null; then exited=true; break; fi
-    sleep 0.1
-  done
-  [ "$exited" = true ] || kill -KILL "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-}
-on_gpt_signal() {
-  trap - TERM INT
-  stop_gpt_process_tree "$codex_pid"
-  codex_pid=''
-  cleanup_gpt_home
-  exit 143
-}
-trap cleanup_gpt_home EXIT
-trap on_gpt_signal TERM INT
+trap 'rm -rf "$isolated_home"' EXIT
+trap 'trap - TERM INT; kill_tree "$codex_pid"; rm -rf "$isolated_home"; exit 143' TERM INT
 
+# key 只放进子进程 env（OPENAI_API_KEY），不写进这个配置文件。
 cat > "$config_file" <<TOML
 model_provider = "anyrouter"
 model = "$model"
@@ -101,7 +77,7 @@ if [ "$codex_status" -eq 0 ]; then
 elif [ "$codex_status" -eq 124 ]; then
   printf 'status=retryable\nhttp_code=000\nelapsed_sec=%s\ncli_exit_code=124\nmessage=request_timeout\n' "$elapsed_sec"
 else
-  diagnostic="$(node "$SCRIPT_DIR/../lib/classify-codex-error.mjs" \
+  diagnostic="$("$(py)" "$SCRIPT_DIR/../lib/classify_codex_error.py" \
     "$stdout_file" "$stderr_file" "$codex_status" 2>/dev/null || true)"
   status="$(awk -F= '$1 == "status" { print $2; exit }' <<< "$diagnostic")"
   http_code="$(awk -F= '$1 == "http_code" { print $2; exit }' <<< "$diagnostic")"

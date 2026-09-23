@@ -1,31 +1,17 @@
-# Anyrouter 
+# Anyrouter Checkalive
 
 本项目只面向 GitHub Actions。它使用一个 Anyrouter key，同时维护两个互不通用的请求池：Claude 池和 GPT 池。一个池拿到 429，不代表另一个池也能用，所以两边分别计时、重试、通知和保存阶段。
 
 ## 它会做什么
 
 1. 每天 UTC 18:00（北京时间/新加坡时间次日 02:00）启动；也可以在 Actions 页面手动运行 `start`。
-2. Claude 和 GPT 各自每次请求完成后随机等待 3–10 秒，直到该池成功。
-3. 某个池成功后发 QQ 邮件提醒“可以使用”，并切换为每次 30–120 秒的随机保活。
+2. Claude 和 GPT 各自每次请求完成后随机等待 3–10 秒，直到该池成功（探测阶段）。
+3. 某个池成功后发 QQ 邮件提醒"可以使用"，然后按 `ANYROUTER_KEEPALIVE_SEC` 决定：
+   - 留空：默认每次 180–300 秒随机保活；
+   - `0`：不保活，该池发完邮件就结束；两池都结束后整条链停止，不再 relay；
+   - `N` 或 `A-B`：固定 N 秒，或 A 到 B 秒随机。
 4. 保活持续到你手动停止；约 4 小时 50 分钟时自动 relay 下一棒，避免 GitHub Actions 的单次时长上限。
 5. relay 只传阶段、模型名、通知标记和链路时间，不传 key、邮箱或 SMTP 授权码。
-
-## 请求是怎样发出的
-
-两个池不仅计时独立，调用工具也不同：
-
-- Claude 池通过 Claude Code CLI 请求 Anyrouter，并使用临时隔离的配置目录。
-- GPT 池通过 Codex CLI 请求 Anyrouter 的 Responses 接口。脚本会临时创建一个只写有 `https://anyrouter.top/v1`、模型名和 `wire_api = "responses"` 的 Codex 配置；key 只放进 Codex 子进程的 `OPENAI_API_KEY` 环境变量，不写进该配置，也不放进命令参数。
-
-临时目录在每次请求结束或被停止时清理，因此不会读取或覆盖运行环境原有的 Claude Code/Codex 用户配置。
-
-## 正式停止方式
-
-在 `Actions -> Anyrouter Keepalive -> Run workflow` 中选择 `mode=stop`。stop job 会写一个保存一天的无 Secret marker，并两次扫描、取消同一工作流里排队或运行中的旧链。
-
-直接点击某个 run 的 **Cancel** 只能作为兜底：它不会写 marker，已经 dispatch 但尚未启动的下一棒可能重新运行。第二天的 cron 会生成新的链路时间，因此不会被前一天的 stop marker 永久挡住；永久停用请在 Actions 页面禁用 workflow。
-
-GitHub Actions 无法自动感知你是否已经在本地开始使用 Anyrouter。即使你打开了 Claude 或 GPT，云端保活也不会自己停；用完后仍要手动运行 `mode=stop`。
 
 ## 配置
 
@@ -33,38 +19,105 @@ GitHub Actions 无法自动感知你是否已经在本地开始使用 Anyrouter�
 
 | 名称 | 类型 | 用途 |
 | --- | --- | --- |
-| `ANYROUTER_TOKENS` | Secret | 一个 key；兼容读取多行格式，但正式请求只使用第一条非空行 |
+| `ANYROUTER_TOKENS` | Secret | 一个 key；兼容多行格式，只使用第一条非空行 |
 | `QQ_EMAIL` | Secret | 可选，接收成功和配置错误提醒 |
 | `QQ_SMTP_AUTH_CODE` | Secret | 可选，QQ 邮箱 SMTP 授权码，不是登录密码 |
-| `ANYROUTER_CLAUDE_MODEL` | Variable | 可选覆盖；留空固定使用已验证的 Claude CLI 别名 `opus[1m]` |
-| `ANYROUTER_GPT_MODEL` | Variable | 可选覆盖；留空自动发现最新 GPT 文本模型 |
+| `ANYROUTER_CLAUDE_MODEL` | Variable | 可选；留空使用 `opus[1m]`；支持语义写法，见下 |
+| `ANYROUTER_GPT_MODEL` | Variable | 可选；留空自动选最新 GPT 文本模型；支持语义写法 |
+| `ANYROUTER_KEEPALIVE_SEC` | Variable | 可选；保活间隔，见上 |
 
-默认地址是 `https://anyrouter.top/v1`。手动输入 `base_url` 时也会去掉多余的末尾斜杠，避免出现 `/v1/v1`。
+模型名要放在 **Variables** 而不是 Secrets：Secret 的值会在日志里被打码成 `***`，比如写 `5.5` 会让 `gpt-5.5` 在日志里显示成 `gpt-***`。
 
-GPT 模型会从 `/models` 过滤 GPT 家族，排除 embedding、image、audio、tts、transcribe、realtime 等非聊天模型，并按可识别版本确定性排序。Claude 默认不从 `/models` 选择别名，而是使用已验证的 `opus[1m]`；只有填写 `ANYROUTER_CLAUDE_MODEL` 时才使用你的覆盖值。Variables 只在你想固定 GPT 模型或改用其他 Claude 别名时填写。
+### 模型选择器（语义选模）
+
+| 写法 | 效果 |
+| --- | --- |
+| 留空 | Claude 用 `opus[1m]`；GPT 从 `/models` 选最新 |
+| `5.5` | 从 `/models` 找 id 里含 `5.5`（`5-5`、`5.5`、`55` 都算）的模型，Claude 优先 fable > opus > sonnet > haiku，同级取日期最新 |
+| `sonnet 5.5` | 多个关键词须全部命中，例如只要 sonnet 的 5.5 |
+| `fable51` / `fable 5.1` | 只要 fable 5.1；`fable5` 则取 fable 5.x 里最新的 |
+| `claude-opus-5-5-20260301` / `gpt-5.5` | 完整 id，原样使用，不请求 `/models` |
+| `opus[1m]` | Claude Code CLI 别名，原样传给 CLI |
+
+语义写法匹配不到时：Claude 池退回 `opus[1m]` 并在日志中警告；GPT 池进入配置错误并发邮件。
+
+### Claude 的 1M 上下文
+
+Anyrouter 的 Claude 通道要求 1M 上下文。脚本拿到完整 id（如 `claude-opus-5-5-20260301`）时，会自动：
+
+- 按 id 判断档位（fable / opus / sonnet / haiku），设置 `ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5-5-20260301[1M]` 这类环境变量；
+- 以 `--model opus[1m]` 调用 Claude Code CLI，让 CLI 走 1M 分支。
+
+所以 Variable 里不需要自己写 `[1m]`。调用前会清掉运行环境里已有的 `ANTHROPIC_DEFAULT_*_MODEL`，避免被外部配置覆盖。
+
+默认地址是 `https://anyrouter.top/v1`，手动输入 `base_url` 时会去掉多余末尾斜杠。
+
+## 请求是怎样发出的
+
+- Claude 池通过 Claude Code CLI 请求 Anyrouter，使用临时隔离的 HOME 和配置目录。
+- GPT 池通过 Codex CLI 请求 Anyrouter 的 Responses 接口。脚本临时生成只含地址、模型名和 `wire_api = "responses"` 的 Codex 配置；key 只放进子进程的 `OPENAI_API_KEY` 环境变量，不写进配置、不放进命令参数。
+
+临时目录在每次请求结束或被停止时清理，不会读取或覆盖运行环境原有的 Claude Code / Codex 用户配置。
+
+## 正式停止方式
+
+在 `Actions -> Anyrouter Keepalive -> Run workflow` 中选择 `mode=stop`。stop job 会写一个保存一天的 stop marker，并两次扫描、取消同一工作流里排队或运行中的旧链。
+
+直接点某个 run 的 **Cancel** 只能兜底：它不会写 marker，已经 dispatch 但尚未启动的下一棒可能重新运行。第二天的 cron 会生成新的链路时间，不会被前一天的 stop marker 永久挡住；永久停用请在 Actions 页面禁用 workflow。
+
+GitHub Actions 无法自动感知你是否已经在本地开始使用 Anyrouter；用完后仍要手动运行 mode=stop。或者把 `ANYROUTER_KEEPALIVE_SEC` 设成 `0`，可用即通知、通知完即停。
 
 ## 工作流
 
 | 工作流 | 用途 |
 | --- | --- |
-| `Anyrouter Keepalive` | 定时双池挤号、保活、relay、`mode=stop` |
-| `Anyrouter Keepalive (Once)` | 手动各请求一次，不 relay，适合离线或短测 |
-| `Anyrouter Recovery Monitor (Legacy)` | 旧入口（legacy），仅保留兼容；新部署使用主工作流 |
+| `Anyrouter Keepalive` | 定时双池探测、保活、relay、`mode=stop` |
+| `Anyrouter Keepalive (Once)` | 手动各请求一次，不 relay，适合短测 |
+
+旧的 legacy 入口（`keepalive.sh`、`run-all.sh`、`monitor-recovery`）已删除。
 
 ## 怎么看 Actions 日志
 
-主循环每次请求只输出经过筛选的状态，不输出 prompt、key、模型回答或 CLI 原始报错。请求日志包含 `pool`（Claude/GPT 池）、`phase`（`probing` 挤号或 `keepalive` 保活）、`model`、`status`、`http_code`、`elapsed_sec`、`cli_exit_code` 和 `message`；等待日志还会显示 `next_delay_sec`。例如看到 `status=rate_limited message=capacity_limited`，表示该池仍在排队，稍后会继续尝试。`cli_exit_code` 始终是非负整数；超时为 `124`，参数尚未启动 CLI 的本地校验结果为 `0`。Claude 子进程关闭 CLI 自带的长时间内部重试，由池工作器统一控制下一次请求的 3–10 秒等待；超时后仍会检查 CLI 已写入的私有错误流，因此明确的模型、鉴权或限流错误不会继续伪装成普通超时。
+日志是中文的，每次请求一行，不输出 prompt、key、模型回答或 CLI 原始报错：
 
-Claude 和 GPT 的状态、`notified` 标记及成功邮件彼此独立：哪个池先从挤号进入保活，就立即只发送哪个池的邮件；另一个池继续自己的挤号或保活。邮件发送失败只记一条安全错误，不会回退池状态，也不会终止另一池或整个工作流。
+```
+[Claude池] 阶段=探测中 模型=claude-opus-5-5-20260301 状态=限流 HTTP=429 耗时=3秒 CLI退出码=1 原因=容量受限
+[Claude池] 阶段=探测中 下次等待=7秒
+[GPT池] 阶段=保活中 模型=gpt-5.5 状态=成功 HTTP=000 耗时=12秒 CLI退出码=0 原因=收到回复
+```
 
-快速启动失败会只记录白名单诊断：`cli_command_unavailable`（命令不存在/不可执行）、`cli_argument_error`（CLI 参数错误）、`cli_configuration_error`（CLI 配置错误）或 `transport_error`（TLS/DNS/连接错误）。
+| 字段 | 含义 |
+| --- | --- |
+| 阶段 | 探测中 / 保活中 / 配置错误 / 已完成 / 已停止 |
+| 状态 | 成功 / 限流 / 可重试 / 无效 |
+| HTTP | CLI 能安全提供的状态码；`000` 表示 CLI 没给，不是真的 HTTP 000 |
+| CLI退出码 | 始终是非负整数；超时为 `124` |
+| 原因 | 见下表 |
 
-GPT adapter 使用 Codex 的 JSONL 事件流安全识别 `turn.failed` 和 `error`。只有错误事件明确包含 HTTP 状态时才记录真实的 `http_code`；例如 429 会显示 `http_code=429 message=capacity_limited`，5xx 会显示 `message=upstream_error`。如果 Codex 只报告 Responses 流提前断开而没有状态码，则保留 `http_code=000`，同时显示 `message=response_stream_error`。原始事件、上游正文和错误详情仍只存在于临时目录，不会写入 Actions 日志。
+| 原因 | 内部代码 | 说明 |
+| --- | --- | --- |
+| 容量受限 | `capacity_limited` | 429/503/529，继续探测 |
+| 鉴权失败 | `authentication_error` | key 无效，池进入配置错误 |
+| 模型不存在或协议不兼容 | `model_or_protocol_error` | 自动换下一个候选模型，没有候选则配置错误 |
+| 请求超时 | `request_timeout` | 继续重试 |
+| 网络错误 | `transport_error` | TLS/DNS/连接问题，继续重试 |
+| 响应流中断 | `response_stream_error` | Codex Responses 流提前断开 |
+| CLI命令不可用 / CLI参数错误 / CLI配置错误 | `cli_*` | 本地安装或参数问题 |
 
-CLI 经 Claude 或 Codex 调用时通常无法可靠取到上游 HTTP 状态码，所以日志中的 `http_code=000` 表示“CLI 没有提供可安全记录的状态码”，不是一次 HTTP 000 请求。Claude Code 内置的 `fable[1m]`、`opus[1m]` 是别名，CLI 会先解析到 `ANTHROPIC_DEFAULT_FABLE_MODEL` 或 `ANTHROPIC_DEFAULT_OPUS_MODEL` 再发送 1M 请求；日志中的方括号现在会原样保留。Anyrouter 返回 503/529 时表示容量或池暂不可用，适配器会快速记录 `capacity_limited` 并按 3–10 秒继续 probing，不再让 Claude CLI 自己重试到 120 秒。`message=model_or_protocol_error` 仍表示当前模型不存在/不受支持，或者 Anyrouter 当前不兼容所用协议；固定 Variable 时应检查模型映射，自动发现时会继续尝试下一个候选。
+内部代码（右列）是 state 文件和 relay 用的英文值，日志只显示中文。Claude 子进程关闭了 CLI 自带重试（`CLAUDE_CODE_MAX_RETRIES=0`），由池 worker 统一控制 3–10 秒的重试节奏。
+
+两个池的状态、通知标记和邮件彼此独立；邮件发送失败只记一条错误，不会回退池状态。
 
 ## 安全与本地测试
 
-真实 key 只在 GitHub Secret 中使用，不放 workflow input、relay body、artifact 名称、邮件正文、日志或主运行链的命令参数。Claude adapter 通过临时隔离 `HOME` 调用 CLI，不覆盖调用者现有 `.claude/settings.json`；GPT adapter 同样使用隔离的 Codex 配置目录。旧的 legacy `scripts/keepalive.sh TOKEN ...` 仅为兼容保留；正式双池链通过环境变量传递 token。本地测试使用假 `claude`、假 `codex`、假 `curl`、假 key 和临时 HOME，分别模拟两个 CLI 和辅助 HTTP 请求；不会访问真实 Anyrouter。
+真实 key 只在 GitHub Secret 中使用，只通过环境变量传给子进程，不出现在命令参数、workflow input、relay body、artifact、邮件或日志里。
+
+本地测试：
+
+```
+bash tests/run-tests.sh
+```
+
+测试使用假 `claude`、假 codex、假 `curl`、假 key 和临时 HOME，不会访问真实 Anyrouter。需要 bash、python3、GNU `timeout`。
 
 项目不承诺请求一定能提高 Anyrouter 优先级，只报告实际观察到的成功、429、网络故障或配置错误。请遵守 Anyrouter 的服务条款和 GitHub Actions 使用限制。

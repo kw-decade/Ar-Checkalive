@@ -45,5 +45,6 @@ jobs:
           ANYROUTER_BASE_URL: ${{ inputs.base_url || 'https://anyrouter.top/v1' }}
           ANYROUTER_CLAUDE_MODEL: ${{ vars.ANYROUTER_CLAUDE_MODEL }}
           ANYROUTER_GPT_MODEL: ${{ vars.ANYROUTER_GPT_MODEL }}
+          KEEPALIVE_SEC: ${{ vars.ANYROUTER_KEEPALIVE_SEC }}
           MAX_DURATION_SEC: 60
         run: bash scripts/run-dual-pool.sh --mode start --once

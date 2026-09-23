@@ -24,7 +24,7 @@ case "$mode" in start|relay) ;; *) printf 'Mode must be start or relay\n' >&2; e
 
 chain_started_epoch="${CHAIN_STARTED_EPOCH:-}"
 if [ "$mode" = relay ] && ! [[ "$chain_started_epoch" =~ ^[1-9][0-9]*$ ]]; then
-  printf '%s\n' 'Relay requires a valid inherited CHAIN_STARTED_EPOCH.' >&2
+  printf '%s\n' 'relay 模式需要继承有效的 CHAIN_STARTED_EPOCH' >&2
   exit 2
 fi
 if [ "$mode" = start ] && ! [[ "$chain_started_epoch" =~ ^[1-9][0-9]*$ ]]; then
@@ -33,36 +33,29 @@ fi
 chain_id="${CHAIN_ID:-}"
 [ -n "$chain_id" ] || chain_id="${GITHUB_RUN_ID:-local}-$RANDOM"
 
+# ---------- stop marker：上一次 mode=stop 是否已经叫停这条链 ----------
 check_stop_marker() {
-  local marker_file status stopped
+  local marker_file status=0 stopped
   [ "${SKIP_STOP_CHECK:-false}" != true ] || return 0
+  if [ -z "${STOP_MARKER_FILE:-}" ] && { [ -z "${GITHUB_TOKEN:-}" ] || [ -z "${GITHUB_REPOSITORY:-}" ]; }; then
+    return 0
+  fi
   marker_file="$(mktemp)"
-  status=0
-  if [ -n "${STOP_MARKER_FILE:-}" ]; then
-    download_latest_stop_marker "$marker_file" || status=$?
-  elif [ -n "${GITHUB_TOKEN:-}" ] && [ -n "${GITHUB_REPOSITORY:-}" ]; then
-    download_latest_stop_marker "$marker_file" || status=$?
-  else
-    rm -f "$marker_file"
-    return 0
-  fi
-  if [ "$status" -eq 1 ]; then
-    rm -f "$marker_file"
-    return 0
-  fi
+  download_latest_stop_marker "$marker_file" || status=$?
+  if [ "$status" -eq 1 ]; then rm -f "$marker_file"; return 0; fi
   if [ "$status" -ne 0 ]; then
     rm -f "$marker_file"
-    printf '%s\n' 'Unable to verify the latest stop marker' >&2
+    printf '%s\n' '无法核对最新的 stop marker' >&2
     return 1
   fi
   stopped="$(chain_is_stopped "$marker_file" "$chain_started_epoch")" || {
     rm -f "$marker_file"
-    printf '%s\n' 'Stop marker is invalid' >&2
+    printf '%s\n' 'stop marker 内容无效' >&2
     return 1
   }
   rm -f "$marker_file"
   if [ "$stopped" = true ]; then
-    printf 'Chain %s was stopped before this run began; no model request will be sent.\n' "$chain_id"
+    printf '链 %s 在本次运行开始前已被停止，不再发送任何请求。\n' "$chain_id"
     return 3
   fi
 }
@@ -73,13 +66,8 @@ if [ "$check_only" = true ]; then
   should_run=true
   [ "$stop_status" -eq 3 ] && should_run=false
   [ "$stop_status" -eq 0 ] || [ "$stop_status" -eq 3 ] || exit "$stop_status"
-  if [ -n "${GITHUB_OUTPUT:-}" ]; then
-    printf 'should_run=%s\nchain_started_epoch=%s\nchain_id=%s\n' \
-      "$should_run" "$chain_started_epoch" "$chain_id" >> "$GITHUB_OUTPUT"
-  else
-    printf 'should_run=%s\nchain_started_epoch=%s\nchain_id=%s\n' \
-      "$should_run" "$chain_started_epoch" "$chain_id"
-  fi
+  printf 'should_run=%s\nchain_started_epoch=%s\nchain_id=%s\n' \
+    "$should_run" "$chain_started_epoch" "$chain_id" >> "${GITHUB_OUTPUT:-/dev/stdout}"
   exit 0
 fi
 [ "$stop_status" -eq 3 ] && exit 0
@@ -96,33 +84,9 @@ gpt_state="$state_dir/gpt.state"
 claude_pid=''
 gpt_pid=''
 
-collect_process_tree() {
-  local pid="${1:-}" child children=''
-  [ -n "$pid" ] || return 0
-  if [ -r "/proc/$pid/task/$pid/children" ]; then
-    children="$(cat "/proc/$pid/task/$pid/children" 2>/dev/null || true)"
-  else
-    children="$(ps -ef 2>/dev/null | awk -v parent="$pid" '$3 == parent { print $2 }')"
-  fi
-  for child in $children; do collect_process_tree "$child"; done
-  printf '%s\n' "$pid"
-}
-
 cleanup() {
-  local pid i any_alive tree_pids=''
-  tree_pids="$(collect_process_tree "$claude_pid"; collect_process_tree "$gpt_pid")"
-  for pid in $tree_pids; do kill -TERM "$pid" 2>/dev/null || true; done
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    any_alive=false
-    for pid in $tree_pids; do
-      if kill -0 "$pid" 2>/dev/null; then any_alive=true; break; fi
-    done
-    [ "$any_alive" = true ] || break
-    sleep 0.1
-  done
-  for pid in $tree_pids; do kill -KILL "$pid" 2>/dev/null || true; done
-  [ -z "$claude_pid" ] || wait "$claude_pid" 2>/dev/null || true
-  [ -z "$gpt_pid" ] || wait "$gpt_pid" 2>/dev/null || true
+  kill_tree "$claude_pid"
+  kill_tree "$gpt_pid"
   rm -rf "$state_dir"
 }
 trap cleanup EXIT
@@ -131,7 +95,7 @@ trap 'exit 143' TERM
 
 state_input() {
   local value="$1" default="$2"
-  case "$value" in probing|keepalive|config_error) printf '%s\n' "$value" ;; *) printf '%s\n' "$default" ;; esac
+  case "$value" in probing|keepalive|config_error|done) printf '%s\n' "$value" ;; *) printf '%s\n' "$default" ;; esac
 }
 
 bool_input() {
@@ -144,55 +108,66 @@ claude_notified="$(bool_input "${CLAUDE_NOTIFIED:-false}")"
 gpt_notified="$(bool_input "${GPT_NOTIFIED:-false}")"
 claude_model="${CLAUDE_MODEL:-}"
 gpt_model="${GPT_MODEL:-}"
-claude_inherited="$claude_model"
-gpt_inherited="$gpt_model"
-claude_override="${ANYROUTER_CLAUDE_MODEL:-}"
-gpt_override="${ANYROUTER_GPT_MODEL:-}"
+claude_selector="${ANYROUTER_CLAUDE_MODEL:-}"
+gpt_selector="${ANYROUTER_GPT_MODEL:-}"
 claude_candidates="$state_dir/claude.models"
 gpt_candidates="$state_dir/gpt.models"
 
+# select_model FAMILY INHERITED SELECTOR CANDIDATES_FILE
+# 决定本次运行用哪个模型，并把候选列表写进文件供 worker 在 invalid 时换下一个。
+#   relay 继承了模型 → 直接沿用（不重新拉 /models，省一次请求）
+#   有 selector      → 语义/精确/别名匹配（见 discover_models）
+#   Claude 无 selector → 已验证的别名 opus[1m]
+#   GPT 无 selector    → 自动发现最新 GPT 文本模型
 select_model() {
-  local family="$1" inherited="$2" override="$3" candidates_file="$4" status=0
-  if [ -n "$override" ]; then
-    printf '%s\n' "$override" > "$candidates_file"
-    printf '%s\n' "$override"
-  elif [ "$family" = claude ]; then
-    printf '%s\n' 'opus[1m]' > "$candidates_file"
-    printf '%s\n' 'opus[1m]'
-  elif [ -n "$inherited" ]; then
+  local family="$1" inherited="$2" selector="$3" candidates_file="$4" status=0
+  if [ -n "$inherited" ]; then
     printf '%s\n' "$inherited" > "$candidates_file"
     printf '%s\n' "$inherited"
-  else
-    set +e
-    discover_models "$family" "$base_url" "$token" "$override" > "$candidates_file"
-    status=$?
-    set -e
-    [ "$status" -eq 0 ] || return "$status"
-    sed -n '1p' "$candidates_file"
+    return 0
   fi
+  if [ -z "$selector" ] && [ "$family" = claude ]; then
+    printf '%s\n' 'opus[1m]' > "$candidates_file"
+    printf '%s\n' 'opus[1m]'
+    return 0
+  fi
+  set +e
+  discover_models "$family" "$base_url" "$token" "$selector" > "$candidates_file"
+  status=$?
+  set -e
+  if [ "$status" -ne 0 ] && [ "$family" = claude ]; then
+    # Claude 选不到就退回默认别名，而不是让整个池报配置错误。
+    printf '[Claude池] 选择器「%s」没有匹配到模型，退回 opus[1m]\n' "$selector" >&2
+    printf '%s\n' 'opus[1m]' > "$candidates_file"
+    printf '%s\n' 'opus[1m]'
+    return 0
+  fi
+  [ "$status" -eq 0 ] || return "$status"
+  sed -n '1p' "$candidates_file"
 }
 
 notify_discovery_error() {
-  local family="$1" subject body
+  local family="$1" family_cn subject body
+  case "$family" in claude) family_cn='Claude池' ;; *) family_cn='GPT池' ;; esac
   if [ -n "${EMAIL_LOG:-}" ]; then
     mkdir -p "$(dirname "$EMAIL_LOG")"
     printf '%s|config_error\n' "$family" >> "$EMAIL_LOG"
     return 0
   fi
   [ "${DRY_RUN:-false}" != true ] || return 0
-  subject="Anyrouter ${family} pool configuration error"
-  body="Pool: $family
-Status: model discovery failed
-Action: ${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-unknown}/actions/runs/${GITHUB_RUN_ID:-unknown}"
-  send_email_safe "$subject" "$body" || printf '%s model discovery notification failed\n' "$family" >&2
+  subject="Anyrouter ${family_cn} 配置错误"
+  body="池：$family_cn
+状态：模型发现失败
+Actions：${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-unknown}/actions/runs/${GITHUB_RUN_ID:-unknown}"
+  send_email_safe "$subject" "$body" || printf '[%s] 模型发现失败的通知邮件发送失败\n' "$family_cn" >&2
 }
 
 claude_model_status=0
 gpt_model_status=0
 set +e
-claude_model="$(select_model claude "$claude_model" "$claude_override" "$claude_candidates")"
+claude_model="$(select_model claude "$claude_model" "$claude_selector" "$claude_candidates")"
 claude_model_status=$?
-gpt_model="$(select_model gpt "$gpt_model" "$gpt_override" "$gpt_candidates")"
+gpt_model="$(select_model gpt "$gpt_model" "$gpt_selector" "$gpt_candidates")"
 gpt_model_status=$?
 set -e
 if [ "$claude_model_status" -ne 0 ]; then
@@ -214,31 +189,23 @@ worker_iterations="${MAX_ITERATIONS:-0}"
 if [ "$once" = true ] && [ "$worker_iterations" -eq 0 ]; then worker_iterations=1; fi
 
 start_pool() {
-  local pool="$1" model="$2" state_file="$3" candidates_file="$4" override="$5" rediscovery=false
-  [ "$pool" = gpt ] && [ -z "$override" ] && rediscovery=true
+  local pool="$1" model="$2" state_file="$3" candidates_file="$4" selector="$5"
   unset GITHUB_TOKEN ANYROUTER_TOKENS
   CHAIN_ID="$chain_id" CHAIN_STARTED_EPOCH="$chain_started_epoch" \
     MAX_DURATION_SEC="$max_duration" MAX_ITERATIONS="$worker_iterations" \
-    MODEL_CANDIDATES_FILE="$candidates_file" MODEL_OVERRIDE="$override" \
-    ALLOW_MODEL_REDISCOVERY="$rediscovery" \
+    MODEL_CANDIDATES_FILE="$candidates_file" MODEL_OVERRIDE="$selector" \
     ANYROUTER_TOKEN="$token" bash "$pool_worker" "$pool" "$base_url" "$model" "$state_file"
 }
 
-if [ "$claude_phase" != config_error ]; then
-  start_pool claude "$claude_model" "$claude_state" "$claude_candidates" "$claude_override" &
-  claude_pid=$!
-fi
-if [ "$gpt_phase" != config_error ]; then
-  start_pool gpt "$gpt_model" "$gpt_state" "$gpt_candidates" "$gpt_override" &
-  gpt_pid=$!
-fi
+case "$claude_phase" in config_error|done) ;; *) start_pool claude "$claude_model" "$claude_state" "$claude_candidates" "$claude_selector" & claude_pid=$! ;; esac
+case "$gpt_phase" in config_error|done) ;; *) start_pool gpt "$gpt_model" "$gpt_state" "$gpt_candidates" "$gpt_selector" & gpt_pid=$! ;; esac
 
 claude_exit=0
 gpt_exit=0
 if [ -n "$claude_pid" ]; then wait "$claude_pid" || claude_exit=$?; claude_pid=''; fi
 if [ -n "$gpt_pid" ]; then wait "$gpt_pid" || gpt_exit=$?; gpt_pid=''; fi
-[ "$claude_exit" -eq 0 ] || printf 'Claude pool worker exited with status %s\n' "$claude_exit" >&2
-[ "$gpt_exit" -eq 0 ] || printf 'GPT pool worker exited with status %s\n' "$gpt_exit" >&2
+[ "$claude_exit" -eq 0 ] || printf '[Claude池] worker 异常退出，状态码 %s\n' "$claude_exit" >&2
+[ "$gpt_exit" -eq 0 ] || printf '[GPT池] worker 异常退出，状态码 %s\n' "$gpt_exit" >&2
 
 [ "$once" = false ] || exit $((claude_exit || gpt_exit))
 
@@ -249,16 +216,17 @@ gpt_model="$(read_state_value "$gpt_state" model 2>/dev/null || true)"
 claude_notified="$(read_state_value "$claude_state" notified 2>/dev/null || printf false)"
 gpt_notified="$(read_state_value "$gpt_state" notified 2>/dev/null || printf false)"
 
-if [ "$claude_phase" = config_error ] && [ "$gpt_phase" = config_error ]; then
-  printf '%s\n' 'Both pools have configuration errors; relay was not scheduled.' >&2
+# 两个池都到了终态（配置错误 / 不保活已完成）→ 链结束，不 relay。
+if [[ "$claude_phase" =~ ^(config_error|done)$ ]] && [[ "$gpt_phase" =~ ^(config_error|done)$ ]]; then
+  printf '两个池均已结束（Claude=%s，GPT=%s），链路终止，不再 relay。\n' "$claude_phase" "$gpt_phase"
   exit 0
 fi
 
 if ! dispatch_relay "$claude_phase" "$gpt_phase" "$claude_model" "$gpt_model" \
   "$claude_notified" "$gpt_notified" "$chain_id" "$chain_started_epoch"; then
-  send_email_safe 'Anyrouter relay failed' \
-    "The next keepalive run could not be scheduled. Action: ${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-unknown}/actions/runs/${GITHUB_RUN_ID:-unknown}" || true
-  printf '%s\n' 'Relay dispatch failed; no credentials were placed in the relay body.' >&2
+  send_email_safe 'Anyrouter relay 失败' \
+    "下一棒保活没能调度成功。Actions：${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-unknown}/actions/runs/${GITHUB_RUN_ID:-unknown}" || true
+  printf '%s\n' 'relay 调度失败；relay body 里没有任何凭据。' >&2
   exit 1
 fi
-printf 'Relay scheduled for chain %s.\n' "$chain_id"
+printf '已为链 %s 调度下一棒 relay。\n' "$chain_id"
