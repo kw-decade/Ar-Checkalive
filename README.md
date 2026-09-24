@@ -102,6 +102,7 @@ GitHub Actions 无法自动感知你是否已经在本地开始使用 Anyrouter�
 | 请求超时 | `request_timeout` | 继续重试 |
 | 网络错误 | `transport_error` | TLS/DNS/连接问题，继续重试 |
 | 响应流中断 | `response_stream_error` | Codex Responses 流提前断开 |
+| 上游错误 | `upstream_error` | 5xx；Codex 显示的 "We’re currently experiencing high demand" 就是上游 500，继续探测 |
 | CLI命令不可用 / CLI参数错误 / CLI配置错误 | `cli_*` | 本地安装或参数问题 |
 
 内部代码（右列）是 state 文件和 relay 用的英文值，日志只显示中文。Claude 子进程关闭了 CLI 自带重试（`CLAUDE_CODE_MAX_RETRIES=0`），由池 worker 统一控制 3–10 秒的重试节奏。

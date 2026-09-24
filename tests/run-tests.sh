@@ -927,7 +927,28 @@ CASES
   done
 }
 
+test_gpt_adapter_maps_codex_500_messages() {
+  setup_adapter_fixture || return
+  write_fake_codex
+  local output
+  export CODEX_TEST_DIR="$ADAPTER_TEST_DIR" CODEX_EXIT=1 CODEX_STDERR=''
+  export CODEX_STDOUT='{"type":"turn.failed","error":{"message":"We’re currently experiencing high demand, which may cause temporary errors."}}'
+  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" ANYROUTER_TOKEN='sk-ant-secret-value' \
+    bash "$ROOT_DIR/scripts/adapters/gpt.sh" 'https://anyrouter.top/v1' 'gpt-test' 'Review code' 2>&1)"
+  assert_contains "$output" 'status=retryable' && assert_contains "$output" 'http_code=500' &&
+    assert_contains "$output" 'message=upstream_error' || { rm -rf "$ADAPTER_TEST_DIR"; return 1; }
+  export CODEX_STDOUT='{"type":"error","message":"unexpected status 502 Bad Gateway: private body"}'
+  output="$(PATH="$ADAPTER_TEST_DIR/bin:$PATH" ANYROUTER_TOKEN='sk-ant-secret-value' \
+    bash "$ROOT_DIR/scripts/adapters/gpt.sh" 'https://anyrouter.top/v1' 'gpt-test' 'Review code' 2>&1)"
+  assert_contains "$output" 'http_code=502' && assert_contains "$output" 'message=upstream_error' &&
+    assert_not_contains "$output" 'private body'
+  local assertion_status=$?
+  rm -rf "$ADAPTER_TEST_DIR"
+  return "$assertion_status"
+}
+
 run_adapter_tests() {
+  run_case "GPT adapter maps Codex's fixed 500 message and 'unexpected status' to real HTTP codes" test_gpt_adapter_maps_codex_500_messages
   run_case "GPT adapter uses an isolated token-free Codex Responses provider" test_gpt_adapter_success_and_json
   run_case "GPT Codex adapter maps 429 without exposing CLI output" test_gpt_adapter_rate_limit
   run_case "GPT Codex adapter safely classifies structured upstream and stream errors" test_gpt_adapter_structured_errors_are_safe_and_distinct
