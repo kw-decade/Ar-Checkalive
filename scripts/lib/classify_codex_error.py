@@ -60,6 +60,8 @@ def main():
         r"\bstatus(?:\s+code)?\s*[:=]\s*([1-5]\d{2})\b",
         r"\b(?:code|http_code|status_code)\s*[:=]\s*([1-5]\d{2})\b",
         r"\"(?:status|status_code|http_code)\"\s*:\s*([1-5]\d{2})\b",
+        # Codex 原文: "unexpected status 502 Bad Gateway: ..."
+        r"\bunexpected status\s+([1-5]\d{2})\b",
     ]
     http_code = "000"
     for pattern in code_patterns:
@@ -67,6 +69,10 @@ def main():
         if match and int(match.group(1)) >= 400:
             http_code = match.group(1)
             break
+    # Codex 把上游 HTTP 500 固定显示成这句话，不带状态码
+    # （codex-rs/protocol/src/error.rs 的 InternalServerError）。
+    if http_code == "000" and re.search(r"currently experiencing high demand", diag, re.I):
+        http_code = "500"
     code = int(http_code)
 
     def has(pattern):
