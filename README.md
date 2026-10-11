@@ -121,4 +121,4 @@ bash tests/run-tests.sh
 
 测试使用假 `claude`、假 codex、假 `curl`、假 key 和临时 HOME，不会访问真实 AXXX。需要 bash、python3、GNU `timeout`。
 
-项目不承诺请求一定能提高 Anyrouter 优先级，只报告实际观察到的成功、429、网络故障或配置错误。请遵守 Anyrouter 的服务条款和 GitHub Actions 使用限制。
+项目不承诺请求一定能提高优先级，只报告实际观察到的成功、429、网络故障或配置错误。请遵守上游的服务条款和 GitHub Actions 使用限制。
